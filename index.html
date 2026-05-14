@@ -88,6 +88,37 @@ body {
 .stock-price.dn .stock-price-chg { color: var(--dn); }
 .stock-price.loading { color: var(--text-3); }
 
+.stock-alert {
+  display: none;
+  background: none; border: none; color: var(--gold);
+  font-size: 13px; cursor: pointer;
+  margin-left: 4px; padding: 4px 5px;
+  border-radius: 4px; line-height: 1;
+}
+.stock-item:hover .stock-alert { display: block; }
+.stock-alert:hover { background: rgba(251,191,36,.15); }
+.alert-dot { color: var(--gold); font-size: 8px; vertical-align: middle; }
+.drag-handle { color: var(--text-3); cursor: grab; padding-right: 6px; font-size: 12px; }
+.stock-item.dragging { opacity: .5; }
+.watch-group-title {
+  padding: 8px 18px 4px; color: var(--text-2);
+  font-size: 10px; letter-spacing: .8px; text-transform: uppercase;
+}
+.group-editor-row {
+  display: grid; grid-template-columns: 1fr 150px; gap: 8px;
+  align-items: center; padding: 8px 0; border-bottom: 1px solid var(--border);
+}
+.modal select {
+  width: 100%; background: var(--bg-2); border: 1px solid var(--border-light);
+  color: var(--text-0); padding: 9px 10px; border-radius: 5px;
+}
+.compare-check {
+  display: flex; align-items: center; gap: 8px; padding: 7px 0;
+  color: var(--text-0); font-size: 13px;
+}
+.compare-check input { width: auto; margin: 0; }
+.compare-chart-wrap { height: 360px; margin-top: 14px; }
+
 .stock-delete {
   display: none;
   background: none; border: none; color: var(--text-3);
@@ -364,6 +395,7 @@ body {
         <span>📌 監控清單</span>
         <div class="actions">
           <button id="addStockBtn" title="新增股票">＋</button>
+          <button id="groupBtn" title="分類群組">▦</button>
           <button id="refreshAllBtn" title="重新整理">↻</button>
         </div>
       </div>
@@ -372,6 +404,7 @@ body {
 
     <div class="sidebar-footer">
       <a id="settingsLink">⚙ 設定 API Key</a>
+      <a id="compareLink">📊 多股票比較圖</a>
       <a id="aboutLink" style="font-size:10px;color:var(--text-3);">v1.3 · 資料延遲約15分鐘</a>
     </div>
   </aside>
@@ -422,10 +455,65 @@ body {
   </div>
 </div>
 
+
+
+<!-- Group Modal -->
+<div id="groupModal" class="modal-overlay">
+  <div class="modal">
+    <h3>📂 分類群組</h3>
+    <p>替監控清單股票指定群組，sidebar 會依群組顯示。</p>
+    <label>新增群組</label>
+    <div style="display:flex;gap:8px;">
+      <input id="newGroupName" type="text" placeholder="例如：AI、金融、觀察中" />
+      <button id="newGroupBtn" class="add-to-watchlist" style="margin:0;">新增</button>
+    </div>
+    <div id="groupEditor" style="max-height:360px;overflow:auto;margin:10px 0;"></div>
+    <div class="modal-actions">
+      <button id="groupCancelBtn">取消</button>
+      <button id="groupSaveBtn" class="primary">儲存</button>
+    </div>
+  </div>
+</div>
+
+<!-- Alert Modal -->
+<div id="alertModal" class="modal-overlay">
+  <div class="modal">
+    <h3>🔔 價格警示</h3>
+    <p id="alertStockLabel"></p>
+    <input id="alertCode" type="hidden" />
+    <label>方向</label>
+    <select id="alertDirection">
+      <option value="above">突破目標價</option>
+      <option value="below">跌破目標價</option>
+    </select>
+    <label>目標價</label>
+    <input id="alertTarget" type="number" step="0.01" placeholder="例如：1000" />
+    <div class="modal-actions">
+      <button id="alertClearBtn">清除</button>
+      <button id="alertCancelBtn">取消</button>
+      <button id="alertSaveBtn" class="primary">儲存</button>
+    </div>
+  </div>
+</div>
+
+<!-- Compare Modal -->
+<div id="compareModal" class="modal-overlay">
+  <div class="modal" style="max-width:860px;">
+    <h3>📊 多股票比較圖</h3>
+    <p>選擇最多 8 檔股票，圖表顯示近 3 個月收盤價漲跌幅。</p>
+    <div id="comparePicker" style="display:grid;grid-template-columns:repeat(2,1fr);gap:0 18px;max-height:220px;overflow:auto;"></div>
+    <div class="compare-chart-wrap"><canvas id="compareChart"></canvas></div>
+    <div class="modal-actions">
+      <button id="compareCancelBtn">關閉</button>
+      <button id="compareRenderBtn" class="primary">產生比較圖</button>
+    </div>
+  </div>
+</div>
+
 <!-- Toast -->
 <div id="toast" class="toast"></div>
 
-<script src="stock-dashboard.js?v=20260514-11"></script>
+<script src="stock-dashboard.js?v=20260515-2"></script>
 
 </body>
 </html>

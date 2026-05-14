@@ -29,6 +29,202 @@ let priceChart = null;
 let chartRange = '4mo';
 let pendingAIAnalysis = null;
 
+function getStockGroup(stock) {
+  return stock.group || '未分類';
+}
+
+function getAllGroups() {
+  return [...new Set(WATCH_LIST.map(getStockGroup))].sort((a, b) => a.localeCompare(b, 'zh-TW'));
+}
+
+function getAlerts() {
+  try { return JSON.parse(localStorage.getItem('priceAlerts') || '{}'); }
+  catch(e) { return {}; }
+}
+
+function saveAlerts(alerts) {
+  localStorage.setItem('priceAlerts', JSON.stringify(alerts));
+}
+
+function setStockAlert(code, target, direction) {
+  const alerts = getAlerts();
+  if (!target) delete alerts[code];
+  else alerts[code] = { target: Number(target), direction, triggered: false };
+  saveAlerts(alerts);
+}
+
+function checkPriceAlert(code, price) {
+  const alerts = getAlerts();
+  const alert = alerts[code];
+  if (!alert || alert.triggered || !Number.isFinite(price)) return;
+  const hit = alert.direction === 'below' ? price <= alert.target : price >= alert.target;
+  if (!hit) return;
+  alert.triggered = true;
+  alerts[code] = alert;
+  saveAlerts(alerts);
+  const msg = `${code} 已${alert.direction === 'below' ? '跌破' : '突破'}目標價 ${alert.target}，目前 ${price.toFixed(2)}`;
+  showToast(msg, 'success');
+  if ('Notification' in window && Notification.permission === 'granted') {
+    new Notification('價格警示', { body: msg });
+  } else if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+}
+
+function moveWatchItem(fromIndex, toIndex) {
+  if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return;
+  const [item] = WATCH_LIST.splice(fromIndex, 1);
+  WATCH_LIST.splice(toIndex, 0, item);
+  saveWatchList();
+  renderWatchlist();
+  loadAllWatchlistPrices();
+}
+
+function buildGroupOptions(selected = '未分類') {
+  const groups = getAllGroups();
+  if (!groups.includes('未分類')) groups.unshift('未分類');
+  return groups.map(group => `<option value="${group}" ${group === selected ? 'selected' : ''}>${group}</option>`).join('');
+}
+
+function showGroupModal() {
+  document.getElementById('groupModal').classList.add('show');
+  renderGroupEditor();
+}
+
+function hideGroupModal() {
+  document.getElementById('groupModal').classList.remove('show');
+}
+
+function renderGroupEditor() {
+  const el = document.getElementById('groupEditor');
+  if (!el) return;
+  el.innerHTML = WATCH_LIST.map((stock, index) => `
+    <div class="group-editor-row">
+      <span>${stock.code} ${stock.name || ''}</span>
+      <select data-group-index="${index}">${buildGroupOptions(getStockGroup(stock))}</select>
+    </div>
+  `).join('');
+}
+
+function saveGroupEditor() {
+  document.querySelectorAll('[data-group-index]').forEach(select => {
+    const index = Number(select.dataset.groupIndex);
+    if (WATCH_LIST[index]) WATCH_LIST[index].group = select.value || '未分類';
+  });
+  saveWatchList();
+  hideGroupModal();
+  renderWatchlist();
+  loadAllWatchlistPrices();
+}
+
+function addNewGroup() {
+  const input = document.getElementById('newGroupName');
+  const name = input.value.trim();
+  if (!name) return;
+  WATCH_LIST.forEach(stock => { if (!stock.group) stock.group = '未分類'; });
+  input.value = '';
+  const first = WATCH_LIST.find(stock => getStockGroup(stock) === '未分類');
+  if (first) first.group = name;
+  saveWatchList();
+  renderGroupEditor();
+}
+
+function showAlertModal(code) {
+  const stock = WATCH_LIST.find(s => s.code === code) || currentStock || { code };
+  const alert = getAlerts()[code] || {};
+  document.getElementById('alertCode').value = code;
+  document.getElementById('alertStockLabel').textContent = `${code} ${stock.name || ''}`;
+  document.getElementById('alertTarget').value = alert.target || '';
+  document.getElementById('alertDirection').value = alert.direction || 'above';
+  document.getElementById('alertModal').classList.add('show');
+}
+
+function hideAlertModal() {
+  document.getElementById('alertModal').classList.remove('show');
+}
+
+function saveAlertModal() {
+  const code = document.getElementById('alertCode').value;
+  const target = document.getElementById('alertTarget').value;
+  const direction = document.getElementById('alertDirection').value;
+  setStockAlert(code, target, direction);
+  hideAlertModal();
+  renderWatchlist();
+  loadAllWatchlistPrices();
+}
+
+function clearAlertModal() {
+  const code = document.getElementById('alertCode').value;
+  setStockAlert(code, '', 'above');
+  hideAlertModal();
+  renderWatchlist();
+}
+
+function showCompareModal() {
+  document.getElementById('compareModal').classList.add('show');
+  renderComparePicker();
+}
+
+function hideCompareModal() {
+  document.getElementById('compareModal').classList.remove('show');
+}
+
+function renderComparePicker() {
+  const el = document.getElementById('comparePicker');
+  if (!el) return;
+  el.innerHTML = WATCH_LIST.map((stock, index) => `
+    <label class="compare-check">
+      <input type="checkbox" value="${index}" ${index < 4 ? 'checked' : ''}>
+      <span>${stock.code} ${stock.name || ''}</span>
+    </label>
+  `).join('');
+}
+
+async function renderCompareChart() {
+  const canvas = document.getElementById('compareChart');
+  if (!canvas) return;
+  const selected = [...document.querySelectorAll('#comparePicker input:checked')]
+    .map(input => WATCH_LIST[Number(input.value)])
+    .filter(Boolean)
+    .slice(0, 8);
+  if (!selected.length) {
+    showToast('請至少選一檔股票', 'error');
+    return;
+  }
+  const datasets = [];
+  let labels = [];
+  const colors = ['#3b82f6', '#ef4444', '#10b981', '#fbbf24', '#a78bfa', '#14b8a6', '#ec4899', '#f97316'];
+  for (let i = 0; i < selected.length; i++) {
+    const stock = selected[i];
+    const history = await fetchYahooHistory(stock.code, stock.type, '3mo');
+    if (!history || history.length < 2) continue;
+    if (!labels.length) labels = history.map(row => row.date.slice(5));
+    const base = history[0].close || 1;
+    datasets.push({
+      label: `${stock.code} ${stock.name || ''}`,
+      data: history.map(row => round2((row.close / base - 1) * 100)),
+      borderColor: colors[i % colors.length],
+      backgroundColor: colors[i % colors.length],
+      tension: 0.25,
+      pointRadius: 0,
+    });
+  }
+  if (window.compareChartInstance) window.compareChartInstance.destroy();
+  window.compareChartInstance = new Chart(canvas, {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#e4e7eb' } } },
+      scales: {
+        x: { ticks: { color: '#9ca3af', maxTicksLimit: 8 }, grid: { color: '#1f2937' } },
+        y: { ticks: { color: '#9ca3af', callback: v => v + '%' }, grid: { color: '#1f2937' } },
+      },
+    },
+  });
+}
+
 function loadWatchList() {
   try {
     const saved = localStorage.getItem('watchList');
@@ -65,6 +261,16 @@ function bindEvents() {
     }
   });
   document.getElementById('refreshAllBtn').addEventListener('click', loadAllWatchlistPrices);
+  document.getElementById('groupBtn')?.addEventListener('click', showGroupModal);
+  document.getElementById('compareLink')?.addEventListener('click', showCompareModal);
+  document.getElementById('groupCancelBtn')?.addEventListener('click', hideGroupModal);
+  document.getElementById('groupSaveBtn')?.addEventListener('click', saveGroupEditor);
+  document.getElementById('newGroupBtn')?.addEventListener('click', addNewGroup);
+  document.getElementById('alertCancelBtn')?.addEventListener('click', hideAlertModal);
+  document.getElementById('alertSaveBtn')?.addEventListener('click', saveAlertModal);
+  document.getElementById('alertClearBtn')?.addEventListener('click', clearAlertModal);
+  document.getElementById('compareCancelBtn')?.addEventListener('click', hideCompareModal);
+  document.getElementById('compareRenderBtn')?.addEventListener('click', renderCompareChart);
   document.addEventListener('click', e => {
     if (e.target && e.target.id === 'generateAiBtn') generateCurrentAIAnalysis();
   });
@@ -91,25 +297,54 @@ function bindEvents() {
 function renderWatchlist() {
   const c = document.getElementById('watchlistContainer');
   if (WATCH_LIST.length === 0) {
-    c.innerHTML = `<div class="watchlist-empty">
-      📌 監控清單是空的<br>
-      點上方「＋」新增股票
-    </div>`;
+    c.innerHTML = `<div class="watchlist-empty">📌 監控清單是空的<br>點上方「＋」新增股票</div>`;
     return;
   }
-  c.innerHTML = WATCH_LIST.map((s, i) => `
-    <div class="stock-item" data-index="${i}">
-      <div class="stock-info" onclick="loadStock(WATCH_LIST[${i}])">
-        <div class="stock-code">${s.code}</div>
-        <div class="stock-name">${s.name || '—'}</div>
-      </div>
-      <div class="stock-price loading" id="wl-${s.code}">
-        <div class="stock-price-val">—</div>
-        <div class="stock-price-chg">—</div>
-      </div>
-      <button class="stock-delete" onclick="deleteStockFromList(${i})" title="移除">✕</button>
-    </div>
-  `).join('');
+  const alerts = getAlerts();
+  const groups = getAllGroups();
+  c.innerHTML = groups.map(group => {
+    const items = WATCH_LIST
+      .map((stock, index) => ({ stock, index }))
+      .filter(item => getStockGroup(item.stock) === group);
+    if (!items.length) return '';
+    return `
+      <div class="watch-group">
+        <div class="watch-group-title">${group}</div>
+        ${items.map(({ stock: s, index: i }) => {
+          const alert = alerts[s.code];
+          return `
+            <div class="stock-item" data-index="${i}" draggable="true">
+              <div class="drag-handle" title="拖曳排序">⋮⋮</div>
+              <div class="stock-info" onclick="loadStock(WATCH_LIST[${i}])">
+                <div class="stock-code">${s.code} ${alert ? '<span class="alert-dot">●</span>' : ''}</div>
+                <div class="stock-name">${s.name || '未命名'}</div>
+              </div>
+              <div class="stock-price loading" id="wl-${s.code}">
+                <div class="stock-price-val">--</div>
+                <div class="stock-price-chg">--</div>
+              </div>
+              <button class="stock-alert" onclick="event.stopPropagation(); showAlertModal('${s.code}')" title="價格警示">🔔</button>
+              <button class="stock-delete" onclick="deleteStockFromList(${i})" title="刪除">×</button>
+            </div>`;
+        }).join('')}
+      </div>`;
+  }).join('');
+  bindWatchlistDrag();
+}
+
+function bindWatchlistDrag() {
+  document.querySelectorAll('.stock-item[draggable="true"]').forEach(item => {
+    item.addEventListener('dragstart', e => {
+      e.dataTransfer.setData('text/plain', item.dataset.index);
+      item.classList.add('dragging');
+    });
+    item.addEventListener('dragend', () => item.classList.remove('dragging'));
+    item.addEventListener('dragover', e => e.preventDefault());
+    item.addEventListener('drop', e => {
+      e.preventDefault();
+      moveWatchItem(Number(e.dataTransfer.getData('text/plain')), Number(item.dataset.index));
+    });
+  });
 }
 
 function deleteStockFromList(index) {
@@ -153,7 +388,7 @@ async function handleAddStock() {
   // 自動判斷上市/上櫃（6/5 開頭多為上櫃，但會自動嘗試）
   const type = (code.startsWith('6') || code.startsWith('5')) ? 'TWO' : 'TW';
 
-  WATCH_LIST.push({ code, name: name || code, type });
+  WATCH_LIST.push({ code, name: name || code, type, group: '未分類' });
   saveWatchList();
   renderWatchlist();
   hideAddStockModal();
@@ -210,6 +445,7 @@ function updateWatchlistPrice(code, data) {
     <div class="stock-price-val">${data.price.toFixed(2)}</div>
     <div class="stock-price-chg">${isUp ? '+' : ''}${data.changePct.toFixed(2)}%</div>
   `;
+  checkPriceAlert(code, data.price);
 }
 
 // ─── 資料抓取 (Yahoo Finance + CORS proxy) ──────────────────
@@ -1052,6 +1288,36 @@ function chipValueClass(value) {
   return n > 0 ? 'up' : n < 0 ? 'dn' : '';
 }
 
+function judgePassiveFlowRisk(chip, history, fundamental, news, score) {
+  if (!chip || !chip.enabled) return { level: '資料不足', detail: '尚未取得法人籌碼，無法推估 ETF/指數調整風險', score: 0 };
+  const inst = chip.institutional || {};
+  const foreignLots = toNumber(inst.foreign?.d5) / 1000;
+  const trustLots = toNumber(inst.trust?.d5) / 1000;
+  const volumeRatio = score?.volumePrice?.volumeRatio || 1;
+  const newsCount = (news?.items || []).length;
+  const epsUp = fundamental?.eps?.yoyHint != null && fundamental.eps.yoyHint > 0;
+  const trustBurst = trustLots >= 500 || trustLots >= Math.max(100, Math.abs(foreignLots) * 1.5);
+  const foreignBurst = foreignLots >= 800;
+  const noFundamentalSupport = !epsUp && newsCount <= 1;
+
+  let points = 0;
+  if (trustBurst) points += 35;
+  if (foreignBurst) points += 20;
+  if (volumeRatio >= 1.6) points += 20;
+  if (noFundamentalSupport) points += 15;
+  if (newsCount >= 3 || epsUp) points -= 15;
+
+  const level = points >= 55 ? '高'
+    : points >= 30 ? '中'
+    : '低';
+  const detail = level === '高'
+    ? '投信/外資買超與量能放大，但基本面或新聞支撐不足，需防 ETF/指數調整被誤判為主動買盤。'
+    : level === '中'
+      ? '法人買盤有被動資金可能，需觀察是否連續買超與持股變化。'
+      : '目前較不像單純 ETF/指數調整，仍需搭配新聞與持股變化確認。';
+  return { level, detail, score: clamp(points, 0, 100) };
+}
+
 function calcMarginShortInsight(chip, history) {
   const margin = chip?.margin;
   if (!margin) {
@@ -1221,7 +1487,7 @@ function renderTacticalPanels(tactical) {
   `;
 }
 
-function renderAIScorePanel(score, labels) {
+function renderAIScorePanel(score, labels, passiveFlow = { level: '資料不足', detail: '尚未估算' }) {
   if (!score) return '';
   const item = (title, value, note) => `
     <div class="strategy-box">
@@ -1242,6 +1508,7 @@ function renderAIScorePanel(score, labels) {
       ${item('下跌承接', labels.support, score.governmentBank.label)}
       ${item('量價技術', labels.volume, score.technical.label)}
       ${item('融資融券', score.marginShort.label, score.marginShort.detail)}
+      ${item('被動資金風險', passiveFlow.level, passiveFlow.detail)}
       ${item('風險提示', labels.risk, '籌碼資料可能受套利、ETF、分倉、隔日沖影響')}
     </div>
   `;
@@ -1498,6 +1765,7 @@ function renderDashboard(stock, history, chip = null, fundamental = null, news =
   const signals = generateSignals(latest, indicators);
   const aiProb = calcAIProbability(history, indicators, chip);
   const aiLabels = getAIScoreLabels(aiProb.breakdown, history, indicators, chip);
+  const passiveFlow = judgePassiveFlowRisk(chip, history, fundamental, news, aiProb.breakdown);
   const tactical = buildTacticalView(history, indicators, aiProb.breakdown, aiLabels);
 
   const amp = round2((latest.high - latest.low) / prev.close * 100);
@@ -1650,7 +1918,7 @@ function renderDashboard(stock, history, chip = null, fundamental = null, news =
           <span>🏦 法人籌碼 / 分點</span>
           <span class="badge">${chip?.enabled ? 'FinMind' : '未設定 Token'}</span>
         </div>
-        ${renderAIScorePanel(aiProb.breakdown, aiLabels)}
+        ${renderAIScorePanel(aiProb.breakdown, aiLabels, passiveFlow)}
         ${renderChipDataPanel(chip)}
       </div>
     </div>
@@ -1675,6 +1943,7 @@ function addCurrentToWatchlist() {
     code: currentStock.code,
     name: currentStock.name || currentStock.code,
     type: currentStock.type || 'TW',
+    group: '未分類',
   });
   saveWatchList();
   renderWatchlist();
@@ -1888,11 +2157,24 @@ function generateCurrentAIAnalysis() {
 
 function friendlyAIError(message) {
   const msg = String(message || '');
+  if (msg.includes('timeout') || msg.includes('AbortError')) {
+    return 'AI 分析逾時，可能是 Gemini 忙碌或網路不穩。請稍後再按「重新生成」。';
+  }
   if (msg.includes('quota') || msg.includes('rate') || msg.includes('429')) {
-    return 'Gemini 免費額度或頻率已達上限，請稍後再按「生成分析」。本頁的多空評分、籌碼評分與風險提示仍可正常使用。';
+    return 'Gemini 免費額度或頻率已達上限，請稍後再按「重新生成」。本頁的多空評分、籌碼評分與風險提示仍可正常使用。';
   }
   if (msg.includes('API key')) return 'Gemini API Key 可能無效，請到設定重新確認。';
   return `AI 分析暫時無法產生：${msg}`;
+}
+
+function renderAiRetry(el, label = '重新生成') {
+  const retryBtn = document.createElement('button');
+  retryBtn.id = 'generateAiBtn';
+  retryBtn.className = 'add-to-watchlist';
+  retryBtn.style.marginTop = '10px';
+  retryBtn.textContent = label;
+  el.appendChild(document.createElement('br'));
+  el.appendChild(retryBtn);
 }
 
 async function runAIAnalysis(stock, latest, ind, pattern, signals, history, chip = null) {
@@ -1905,54 +2187,55 @@ async function runAIAnalysis(stock, latest, ind, pattern, signals, history, chip
   el.textContent = '🤖 AI 正在分析中...';
 
   const recent10 = history.slice(-10).map(h => `${h.date} ${h.close.toFixed(2)}`).join(', ');
+  const prompt = `你是專業台股分析師。請針對「${stock.code} ${stock.name}」做繁體中文分析，約 180 字內。
 
-  const prompt = `你是專業台股技術分析師。請針對「${stock.code} ${stock.name}」做簡潔的技術面分析（中文繁體，約 150 字內）。
-
-最新資料：
-- 收盤 ${latest.close}，當日 ${latest.high}/${latest.low}
+技術面：
+- 收盤 ${latest.close}，當日高低 ${latest.high}/${latest.low}
 - MA5/MA20/MA60: ${fmt(ind.ma5)}/${fmt(ind.ma20)}/${fmt(ind.ma60)}
 - KD: ${fmt(ind.kd_k, 1)}/${fmt(ind.kd_d, 1)}
 - RSI14: ${fmt(ind.rsi14, 1)}
 - MACD OSC: ${fmt(ind.macd_osc, 3)}
-- 趨勢型態: ${pattern.name}
+- 型態: ${pattern.name}
 - 近10日收盤: ${recent10}
 
 籌碼面：
 ${buildChipPrompt(chip)}
 
-基本面與新聞：
-- 最新 EPS：${fundamental?.eps ? fundamental.eps.value.toFixed(2) + '（' + fundamental.eps.date + '）' : '無資料'}
-- 新聞摘要：${(news?.items || []).slice(0, 3).map(item => item.title).join('；') || '無新聞資料'}
-
-請以四段呈現（用兩個換行分隔，不用標題符號）：
+請用四段呈現，不要前言：
 1. 趨勢判斷
-2. 關鍵技術訊號
+2. 籌碼與資金歸因
 3. 風險提醒
-4. 操作建議
+4. 操作建議`;
 
-直接輸出分析內容，不要前言。`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('timeout')), 30000);
 
   try {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`;
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.7, maxOutputTokens: 600 }
+        generationConfig: { temperature: 0.55, maxOutputTokens: 520 }
       })
     });
     const data = await res.json();
     if (data.error) throw new Error(data.error.message);
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '無回應';
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || 'AI 沒有回傳分析內容，請稍後重試。';
     el.classList.remove('loading');
     el.textContent = text;
   } catch(e) {
     el.classList.remove('loading');
     el.style.color = 'var(--up)';
-    el.textContent = `❌ AI 分析失敗：${e.message}`;
+    el.textContent = friendlyAIError(e.name === 'AbortError' ? 'timeout' : e.message);
+    renderAiRetry(el);
+  } finally {
+    clearTimeout(timer);
   }
 }
+
 
 function showApiKeyModal() {
   document.getElementById('apiKeyModal').classList.add('show');
