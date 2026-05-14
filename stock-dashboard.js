@@ -455,7 +455,7 @@ function generateSignals(latest, ind) {
   return signals;
 }
 
-function calcAIProbability(history, ind) {
+function calcAIProbability(history, ind, chip = null) {
   let bullScore = 50, bearScore = 50;
   if (ind.ma5 && ind.ma20 && ind.ma60) {
     if (ind.ma5 > ind.ma20 && ind.ma20 > ind.ma60) bullScore += 12;
@@ -481,11 +481,47 @@ function calcAIProbability(history, ind) {
     if (avgChange > 0.03) bullScore += 5;
     else if (avgChange < -0.03) bearScore += 5;
   }
+  const chipScore = calcChipProbabilityScore(chip);
+  bullScore += chipScore.bull;
+  bearScore += chipScore.bear;
   const total = bullScore + bearScore;
   return {
     bull: Math.round(bullScore / total * 100),
     bear: Math.round(bearScore / total * 100),
   };
+}
+
+function calcChipProbabilityScore(chip) {
+  if (!chip || !chip.enabled) return { bull: 0, bear: 0 };
+
+  let bull = 0;
+  let bear = 0;
+  const addFlowScore = (value, weight) => {
+    const lots = toNumber(value) / 1000;
+    if (!Number.isFinite(lots) || lots === 0) return;
+    const score = Math.min(Math.abs(lots) / 150, 1) * weight;
+    if (lots > 0) bull += score;
+    else bear += score;
+  };
+
+  const inst = chip.institutional || {};
+  addFlowScore(inst.foreign?.d1, 5);
+  addFlowScore(inst.foreign?.d5, 8);
+  addFlowScore(inst.trust?.d5, 7);
+  addFlowScore(inst.dealer?.d5, 4);
+  addFlowScore(inst.total?.d20, 8);
+  addFlowScore(chip.governmentBank?.d5, 4);
+
+  const buyNet = (chip.brokers?.buyTop || []).reduce((sum, row) => sum + Math.max(0, toNumber(row.net)), 0);
+  const sellNet = (chip.brokers?.sellTop || []).reduce((sum, row) => sum + Math.abs(Math.min(0, toNumber(row.net))), 0);
+  const brokerTotal = buyNet + sellNet;
+  if (brokerTotal > 0) {
+    const brokerWeight = chip.brokers?.concentration >= 55 ? 7 : 5;
+    bull += (buyNet / brokerTotal) * brokerWeight;
+    bear += (sellNet / brokerTotal) * brokerWeight;
+  }
+
+  return { bull, bear };
 }
 
 
@@ -854,7 +890,7 @@ function renderDashboard(stock, history, chip = null) {
   const pattern = detectPattern(history);
   const candle = detectCandle(history);
   const signals = generateSignals(latest, indicators);
-  const aiProb = calcAIProbability(history, indicators);
+  const aiProb = calcAIProbability(history, indicators, chip);
 
   const amp = round2((latest.high - latest.low) / prev.close * 100);
   const upLimit = round2(prev.close * 1.10);
