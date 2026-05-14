@@ -1359,6 +1359,222 @@ function calcMarginShortInsight(chip, history) {
   return { label, detail, riskScore, marginBalance, shortBalance };
 }
 
+function buildAdvancedDecisionView(history, chip, news, score, labels) {
+  const latest = history[history.length - 1] || {};
+  const prev = history[history.length - 2] || latest;
+  const openPremium = prev.close ? (latest.open - prev.close) / prev.close * 100 : 0;
+  const vwap20 = calcPeriodVwap(history.slice(-20));
+  const vwap10 = calcPeriodVwap(history.slice(-10));
+  const vwap60 = calcPeriodVwap(history.slice(-60));
+  const mainLight = judgeMainLight(history, chip, score, labels);
+  const resonance = calcTrendResonance(history, score);
+  const chipStructure = calcChipStructure20(chip, history);
+  const cost = {
+    foreign: estimateCost(vwap20, chip?.institutional?.foreign?.d20),
+    main: vwap20,
+    retail: vwap10 || vwap20,
+    swing: vwap60 || vwap20,
+    current: latest.close,
+  };
+  const sentiment = calcNewsSentiment(news);
+  return { mainLight, resonance, chipStructure, cost, openPremium, sentiment };
+}
+
+function calcPeriodVwap(rows) {
+  const totalVol = rows.reduce((sum, row) => sum + (row.volume || 0), 0);
+  if (!totalVol) return rows.length ? rows[rows.length - 1].close : 0;
+  const total = rows.reduce((sum, row) => sum + row.close * (row.volume || 0), 0);
+  return round2(total / totalVol);
+}
+
+function estimateCost(base, flow) {
+  const lots = toNumber(flow) / 1000;
+  if (!base) return 0;
+  if (lots > 0) return round2(base * 0.995);
+  if (lots < 0) return round2(base * 1.005);
+  return round2(base);
+}
+
+function judgeMainLight(history, chip, score, labels) {
+  const latest = history[history.length - 1] || {};
+  const prev = history[history.length - 2] || latest;
+  const priceUp = latest.close >= prev.close;
+  const brokerScore = score?.broker?.score || 50;
+  const instScore = score?.institution?.score || 50;
+  const volumeRatio = score?.volumePrice?.volumeRatio || 1;
+  const trust = toNumber(chip?.institutional?.trust?.d5);
+  const foreign = toNumber(chip?.institutional?.foreign?.d5);
+  let state = '觀察';
+  let color = 'var(--gold)';
+  const reasons = [];
+  if (priceUp && brokerScore >= 60 && instScore >= 58) {
+    state = '偏多攻擊';
+    color = 'var(--up)';
+    reasons.push('主力與法人同步偏買');
+  } else if (priceUp && brokerScore < 45 && volumeRatio >= 1.4) {
+    state = '出貨警戒';
+    color = 'var(--dn)';
+    reasons.push('價漲量增但分點偏賣');
+  } else if (!priceUp && (trust > 0 || foreign > 0) && brokerScore >= 50) {
+    state = '洗盤觀察';
+    color = 'var(--gold)';
+    reasons.push('回檔但法人或主力仍有承接');
+  } else {
+    reasons.push(labels?.scenario || '訊號尚未同步');
+  }
+  if (trust > 0) reasons.push('投信偏買');
+  if (foreign > 0) reasons.push('外資偏買');
+  return { state, color, reasons: reasons.slice(0, 3) };
+}
+
+function calcTrendResonance(history, score) {
+  const day = score?.technical?.score || 50;
+  const weekRows = aggregateWeekly(history);
+  const weekCloses = weekRows.map(row => row.close);
+  const weekMa4 = simpleAverage(weekCloses.slice(-4));
+  const weekMa8 = simpleAverage(weekCloses.slice(-8));
+  const weekScore = weekMa4 && weekMa8 ? (weekMa4 > weekMa8 ? 70 : 35) : 50;
+  const total = Math.round((day + weekScore) / 2);
+  const label = total >= 65 ? '多週期偏多'
+    : total <= 40 ? '多週期偏空'
+    : '中性盤整';
+  return {
+    intraday: { label: 'N/A', score: 0, note: '目前未接 60分K' },
+    daily: { label: day >= 60 ? '偏多' : day <= 40 ? '偏空' : '震盪', score: day },
+    weekly: { label: weekScore >= 60 ? '偏多' : weekScore <= 40 ? '偏空' : '震盪', score: weekScore },
+    total,
+    label,
+  };
+}
+
+function aggregateWeekly(history) {
+  const buckets = new Map();
+  for (const row of history) {
+    const d = new Date(row.date);
+    const key = d.getFullYear() + '-' + getWeekNumber(d);
+    const old = buckets.get(key);
+    if (!old) buckets.set(key, { open: row.open, high: row.high, low: row.low, close: row.close, volume: row.volume });
+    else {
+      old.high = Math.max(old.high, row.high);
+      old.low = Math.min(old.low, row.low);
+      old.close = row.close;
+      old.volume += row.volume || 0;
+    }
+  }
+  return [...buckets.values()];
+}
+
+function getWeekNumber(date) {
+  const first = new Date(date.getFullYear(), 0, 1);
+  return Math.ceil((((date - first) / 86400000) + first.getDay() + 1) / 7);
+}
+
+function simpleAverage(values) {
+  const nums = values.filter(Number.isFinite);
+  if (!nums.length) return null;
+  return nums.reduce((a, b) => a + b, 0) / nums.length;
+}
+
+function calcChipStructure20(chip, history) {
+  const inst = chip?.institutional || {};
+  const foreign = Math.abs(toNumber(inst.foreign?.d20) / 1000);
+  const trust = Math.abs(toNumber(inst.trust?.d20) / 1000);
+  const dealer = Math.abs(toNumber(inst.dealer?.d20) / 1000);
+  const totalVolLots = history.slice(-20).reduce((sum, row) => sum + (row.volume || 0), 0) / 1000;
+  const known = foreign + trust + dealer;
+  const retail = Math.max(0, totalVolLots - known);
+  const total = Math.max(known + retail, 1);
+  return {
+    total: Math.round(known),
+    foreignPct: Math.round(foreign / total * 100),
+    trustPct: Math.round(trust / total * 100),
+    dealerPct: Math.round(dealer / total * 100),
+    retailPct: Math.round(retail / total * 100),
+  };
+}
+
+function calcNewsSentiment(news) {
+  const items = news?.items || [];
+  if (!items.length) return { label: '新聞不足', score: 50, detail: '目前沒有足夠新聞可分析' };
+  const positive = ['成長', '創高', '看好', '上修', '接單', '擴產', '旺', '利多', '買超'];
+  const negative = ['下修', '衰退', '虧損', '利空', '調節', '裁員', '警示', '賣超', '跌'];
+  let score = 50;
+  for (const item of items) {
+    const title = item.title || '';
+    if (positive.some(word => title.includes(word))) score += 8;
+    if (negative.some(word => title.includes(word))) score -= 8;
+  }
+  score = clamp(score, 0, 100);
+  return {
+    label: score >= 60 ? '偏正向' : score <= 40 ? '偏負向' : '中性',
+    score,
+    detail: `分析 ${items.length} 則新聞標題`,
+  };
+}
+
+function renderAdvancedDecisionPanels(view) {
+  if (!view) return '';
+  const bar = value => `<div style="height:8px;background:var(--bg-3);border-radius:4px;overflow:hidden;"><div style="height:100%;width:${clamp(value,0,100)}%;background:var(--blue);"></div></div>`;
+  return `
+    <div class="grid-3">
+      <div class="panel">
+        <div class="panel-title">🚦 主力動向警示燈</div>
+        <div style="display:flex;align-items:center;gap:18px;">
+          <div style="width:88px;height:88px;border-radius:50%;background:${view.mainLight.color};box-shadow:0 0 24px ${view.mainLight.color};opacity:.88;"></div>
+          <div>
+            <div style="font-size:24px;font-weight:700;color:${view.mainLight.color};">${view.mainLight.state}</div>
+            <div style="font-size:12px;color:var(--text-2);line-height:1.8;margin-top:6px;">${view.mainLight.reasons.map(r => '• ' + r).join('<br>')}</div>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">🎯 AI 漲跌機率</div>
+        <div style="font-size:42px;font-weight:700;color:var(--up);">${view.resonance.total}%</div>
+        <div style="font-size:12px;color:var(--text-2);">多週期趨勢共振估計</div>
+        <div style="margin-top:12px;">${bar(view.resonance.total)}</div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">⚡ 多週期趨勢共振</div>
+        <div class="indicator-row"><span class="label">60分K</span><span class="value">${view.resonance.intraday.label}</span></div>
+        <div class="indicator-row"><span class="label">日K</span><span class="value">${view.resonance.daily.label}</span></div>
+        <div class="indicator-row"><span class="label">週K</span><span class="value">${view.resonance.weekly.label}</span></div>
+        <div style="margin-top:10px;font-weight:700;color:var(--gold);">${view.resonance.label}</div>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="panel">
+        <div class="panel-title">🧅 籌碼結構（近20日）</div>
+        <div class="strategy-grid">
+          <div class="strategy-box"><div class="label">外資</div><div class="value">${view.chipStructure.foreignPct}%</div></div>
+          <div class="strategy-box"><div class="label">投信</div><div class="value">${view.chipStructure.trustPct}%</div></div>
+          <div class="strategy-box"><div class="label">自營商</div><div class="value">${view.chipStructure.dealerPct}%</div></div>
+          <div class="strategy-box"><div class="label">散戶估</div><div class="value">${view.chipStructure.retailPct}%</div></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">💰 主力成本估算</div>
+        <div class="indicator-row"><span class="label">外資成本</span><span class="value">${view.cost.foreign.toFixed(2)}</span></div>
+        <div class="indicator-row"><span class="label">主力成本</span><span class="value">${view.cost.main.toFixed(2)}</span></div>
+        <div class="indicator-row"><span class="label">散戶成本</span><span class="value">${view.cost.retail.toFixed(2)}</span></div>
+        <div class="indicator-row"><span class="label">現價</span><span class="value">${view.cost.current.toFixed(2)}</span></div>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="panel">
+        <div class="panel-title">📈 開盤溢價率</div>
+        <div style="font-size:34px;font-weight:700;color:${view.openPremium >= 0 ? 'var(--up)' : 'var(--dn)'};">${view.openPremium >= 0 ? '+' : ''}${view.openPremium.toFixed(2)}%</div>
+        <div style="font-size:12px;color:var(--text-2);margin-top:4px;">今開相對昨收，偏高代表買盤積極，但也需防開高走低。</div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">📰 即時新聞 + AI 情緒分析</div>
+        <div style="font-size:24px;font-weight:700;color:${view.sentiment.score >= 60 ? 'var(--up)' : view.sentiment.score <= 40 ? 'var(--dn)' : 'var(--gold)'};">${view.sentiment.label}</div>
+        <div style="font-size:12px;color:var(--text-2);margin-top:4px;">${view.sentiment.detail}</div>
+        <div style="margin-top:12px;">${bar(view.sentiment.score)}</div>
+      </div>
+    </div>
+  `;
+}
+
 function buildTacticalView(history, ind, score, labels) {
   const latest = history[history.length - 1] || {};
   const prev = history[history.length - 2] || latest;
@@ -1766,6 +1982,7 @@ function renderDashboard(stock, history, chip = null, fundamental = null, news =
   const aiProb = calcAIProbability(history, indicators, chip);
   const aiLabels = getAIScoreLabels(aiProb.breakdown, history, indicators, chip);
   const passiveFlow = judgePassiveFlowRisk(chip, history, fundamental, news, aiProb.breakdown);
+  const advancedDecision = buildAdvancedDecisionView(history, chip, news, aiProb.breakdown, aiLabels);
   const tactical = buildTacticalView(history, indicators, aiProb.breakdown, aiLabels);
 
   const amp = round2((latest.high - latest.low) / prev.close * 100);
@@ -1899,6 +2116,8 @@ function renderDashboard(stock, history, chip = null, fundamental = null, news =
           : '💡 設定 Gemini API Key 即可啟用 AI 趨勢分析（免費）'}
       </div>
     </div>
+
+    ${renderAdvancedDecisionPanels(advancedDecision)}
 
     ${renderFundamentalNewsPanel(fundamental, news)}
 
