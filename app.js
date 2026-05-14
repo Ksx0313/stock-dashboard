@@ -455,7 +455,7 @@ function generateSignals(latest, ind) {
   return signals;
 }
 
-function calcAIProbability(history, ind) {
+function calcAIProbability(history, ind, chip = null) {
   let bullScore = 50, bearScore = 50;
   if (ind.ma5 && ind.ma20 && ind.ma60) {
     if (ind.ma5 > ind.ma20 && ind.ma20 > ind.ma60) bullScore += 12;
@@ -481,11 +481,47 @@ function calcAIProbability(history, ind) {
     if (avgChange > 0.03) bullScore += 5;
     else if (avgChange < -0.03) bearScore += 5;
   }
+  const chipScore = calcChipProbabilityScore(chip);
+  bullScore += chipScore.bull;
+  bearScore += chipScore.bear;
   const total = bullScore + bearScore;
   return {
     bull: Math.round(bullScore / total * 100),
     bear: Math.round(bearScore / total * 100),
   };
+}
+
+function calcChipProbabilityScore(chip) {
+  if (!chip || !chip.enabled) return { bull: 0, bear: 0 };
+
+  let bull = 0;
+  let bear = 0;
+  const addFlowScore = (value, weight) => {
+    const lots = toNumber(value) / 1000;
+    if (!Number.isFinite(lots) || lots === 0) return;
+    const score = Math.min(Math.abs(lots) / 150, 1) * weight;
+    if (lots > 0) bull += score;
+    else bear += score;
+  };
+
+  const inst = chip.institutional || {};
+  addFlowScore(inst.foreign?.d1, 5);
+  addFlowScore(inst.foreign?.d5, 8);
+  addFlowScore(inst.trust?.d5, 7);
+  addFlowScore(inst.dealer?.d5, 4);
+  addFlowScore(inst.total?.d20, 8);
+  addFlowScore(chip.governmentBank?.d5, 4);
+
+  const buyNet = (chip.brokers?.buyTop || []).reduce((sum, row) => sum + Math.max(0, toNumber(row.net)), 0);
+  const sellNet = (chip.brokers?.sellTop || []).reduce((sum, row) => sum + Math.abs(Math.min(0, toNumber(row.net))), 0);
+  const brokerTotal = buyNet + sellNet;
+  if (brokerTotal > 0) {
+    const brokerWeight = chip.brokers?.concentration >= 55 ? 7 : 5;
+    bull += (buyNet / brokerTotal) * brokerWeight;
+    bear += (sellNet / brokerTotal) * brokerWeight;
+  }
+
+  return { bull, bear };
 }
 
 
@@ -526,8 +562,7 @@ async function fetchFinMindBrokerData(code, startDate, endDate) {
   if (!token) return [];
   const url = new URL('https://api.finmindtrade.com/api/v4/taiwan_stock_trading_daily_report');
   url.searchParams.set('data_id', code);
-  url.searchParams.set('start_date', startDate);
-  if (endDate) url.searchParams.set('end_date', endDate);
+  url.searchParams.set('date', endDate || startDate);
   url.searchParams.set('token', token);
   const res = await fetch(url.toString(), {
     headers: { Authorization: `Bearer ${token}` }
@@ -538,6 +573,22 @@ async function fetchFinMindBrokerData(code, startDate, endDate) {
   return Array.isArray(json.data) ? json.data : [];
 }
 
+function getRecentHistoryDates(history, count = 20) {
+  return (history || [])
+    .map(row => row.date)
+    .filter(Boolean)
+    .slice(-count);
+}
+
+async function fetchGovernmentBankData(code, history) {
+  const dates = getRecentHistoryDates(history, 20);
+  const chunks = await Promise.all(dates.map(async date => {
+    const rows = await fetchFinMindData('TaiwanStockGovernmentBankBuySell', { start_date: date });
+    return rows.filter(row => String(row.stock_id || row.StockID || row.data_id || '') === String(code));
+  }));
+  return chunks.flat();
+}
+
 async function fetchChipData(code, history) {
   if (!getFinMindToken()) {
     return { enabled: false, status: '未設定 FinMind Token' };
@@ -546,10 +597,10 @@ async function fetchChipData(code, history) {
   const startDate = getRecentStartDate(history, 45);
   const endDate = history?.[history.length - 1]?.date;
   const requests = {
-    institutional: fetchFinMindData('TaiwanStockInstitutionalInvestorsBuySell', { data_id: code, start_date: startDate, end_date: endDate }),
-    shareholding: fetchFinMindData('TaiwanStockShareholding', { data_id: code, start_date: startDate, end_date: endDate }),
-    governmentBank: fetchFinMindData('TaiwanStockGovernmentBankBuySell', { data_id: code, start_date: startDate, end_date: endDate }),
-    margin: fetchFinMindData('TaiwanStockMarginPurchaseShortSale', { data_id: code, start_date: startDate, end_date: endDate }),
+    institutional: fetchFinMindData('TaiwanStockInstitutionalInvestorsBuySell', { data_id: code, start_date: startDate }),
+    shareholding: fetchFinMindData('TaiwanStockShareholding', { data_id: code, start_date: startDate }),
+    governmentBank: fetchGovernmentBankData(code, history),
+    margin: fetchFinMindData('TaiwanStockMarginPurchaseShortSale', { data_id: code, start_date: startDate }),
     brokers: fetchFinMindBrokerData(code, startDate, endDate),
   };
 
@@ -563,11 +614,13 @@ async function fetchChipData(code, history) {
 
   const raw = Object.fromEntries(entries.map(([key, data]) => [key, data]));
   const errors = Object.fromEntries(entries.filter(([, , err]) => err).map(([key, , err]) => [key, err]));
+  const counts = Object.fromEntries(Object.entries(raw).map(([key, rows]) => [key, rows.length]));
 
   return {
     enabled: true,
     status: Object.keys(errors).length ? '部分籌碼資料無法取得' : '籌碼資料已載入',
     errors,
+    counts,
     startDate,
     endDate,
     institutional: summarizeInstitutional(raw.institutional),
@@ -747,6 +800,10 @@ function renderChipDataPanel(chip) {
     <div style="font-size:11px;color:var(--text-2);margin-bottom:10px;">
       區間：${chip.startDate || '--'} ~ ${chip.endDate || '--'}；${chip.status || ''}
     </div>
+    <div style="font-size:10px;color:var(--text-2);margin-bottom:10px;">
+      筆數：法人 ${chip.counts?.institutional || 0}、外資持股 ${chip.counts?.shareholding || 0}、八大 ${chip.counts?.governmentBank || 0}、分點 ${chip.counts?.brokers || 0}
+      ${Object.keys(chip.errors || {}).length ? `<br>錯誤：${Object.entries(chip.errors).map(([k, v]) => `${k}: ${v}`).join('；')}` : ''}
+    </div>
     <div class="indicator-table" style="grid-template-columns:1fr;">
       <div class="indicator-row" style="color:var(--text-2);font-size:11px;">
         <span></span><span>1日</span><span>5日</span><span>20日</span>
@@ -854,7 +911,7 @@ function renderDashboard(stock, history, chip = null) {
   const pattern = detectPattern(history);
   const candle = detectCandle(history);
   const signals = generateSignals(latest, indicators);
-  const aiProb = calcAIProbability(history, indicators);
+  const aiProb = calcAIProbability(history, indicators, chip);
 
   const amp = round2((latest.high - latest.low) / prev.close * 100);
   const upLimit = round2(prev.close * 1.10);
