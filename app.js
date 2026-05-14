@@ -456,72 +456,324 @@ function generateSignals(latest, ind) {
 }
 
 function calcAIProbability(history, ind, chip = null) {
-  let bullScore = 50, bearScore = 50;
-  if (ind.ma5 && ind.ma20 && ind.ma60) {
-    if (ind.ma5 > ind.ma20 && ind.ma20 > ind.ma60) bullScore += 12;
-    else if (ind.ma5 < ind.ma20 && ind.ma20 < ind.ma60) bearScore += 12;
-  }
-  if (ind.kd_k != null && ind.kd_d != null) {
-    if (ind.kd_k > ind.kd_d && ind.kd_k < 80) bullScore += 8;
-    else if (ind.kd_k < ind.kd_d && ind.kd_k > 20) bearScore += 8;
-  }
-  if (ind.macd_osc != null) {
-    if (ind.macd_osc > 0) bullScore += 6;
-    else bearScore += 6;
-  }
-  if (ind.rsi14 != null) {
-    if (ind.rsi14 < 30) bullScore += 8;
-    else if (ind.rsi14 > 70) bearScore += 8;
-    else if (ind.rsi14 > 50 && ind.rsi14 < 65) bullScore += 4;
-    else if (ind.rsi14 < 50 && ind.rsi14 > 35) bearScore += 4;
-  }
-  if (history.length >= 5) {
-    const recent5 = history.slice(-5);
-    const avgChange = (recent5[4].close - recent5[0].close) / recent5[0].close;
-    if (avgChange > 0.03) bullScore += 5;
-    else if (avgChange < -0.03) bearScore += 5;
-  }
-  const chipScore = calcChipProbabilityScore(chip);
-  bullScore += chipScore.bull;
-  bearScore += chipScore.bear;
-  const total = bullScore + bearScore;
+  const score = calcAIScoreBreakdown(history, ind, chip);
   return {
-    bull: Math.round(bullScore / total * 100),
-    bear: Math.round(bearScore / total * 100),
+    bull: score.total,
+    bear: 100 - score.total,
+    breakdown: score,
   };
 }
 
-function calcChipProbabilityScore(chip) {
-  if (!chip || !chip.enabled) return { bull: 0, bear: 0 };
+function calcAIScoreBreakdown(history, ind, chip = null) {
+  const technical = calcTechnicalTrendScore(history, ind);
+  const institution = calcInstitutionScore(chip);
+  const broker = calcBrokerStructureScore(chip);
+  const foreignHolding = calcForeignHoldingScore(chip);
+  const governmentBank = calcGovernmentBankScore(chip);
+  const volumePrice = calcVolumePriceScore(history);
+  const marginShort = calcMarginShortInsight(chip, history);
 
-  let bull = 0;
-  let bear = 0;
-  const addFlowScore = (value, weight) => {
-    const lots = toNumber(value) / 1000;
-    if (!Number.isFinite(lots) || lots === 0) return;
-    const score = Math.min(Math.abs(lots) / 150, 1) * weight;
-    if (lots > 0) bull += score;
-    else bear += score;
+  const total = clamp(Math.round(
+    technical.score * 0.30 +
+    institution.score * 0.25 +
+    broker.score * 0.25 +
+    foreignHolding.score * 0.10 +
+    governmentBank.score * 0.10
+  ), 0, 100);
+
+  return {
+    total,
+    technical,
+    institution,
+    broker,
+    foreignHolding,
+    governmentBank,
+    volumePrice,
+    marginShort,
+    chipOverall: clamp(Math.round(
+      institution.score * 0.35 +
+      broker.score * 0.35 +
+      foreignHolding.score * 0.15 +
+      governmentBank.score * 0.15
+    ), 0, 100),
   };
+}
 
+function calcTechnicalTrendScore(history, ind) {
+  let score = 50;
+  const latest = history[history.length - 1] || {};
+  if (ind.ma5 && ind.ma10 && ind.ma20) {
+    if (latest.close > ind.ma5 && ind.ma5 > ind.ma10 && ind.ma10 > ind.ma20) score += 22;
+    else if (latest.close > ind.ma5 && latest.close > ind.ma20) score += 12;
+    else if (latest.close < ind.ma5 && ind.ma5 < ind.ma10 && ind.ma10 < ind.ma20) score -= 22;
+    else if (latest.close < ind.ma20) score -= 12;
+  }
+  if (ind.macd_osc != null) score += ind.macd_osc > 0 ? 8 : -8;
+  if (ind.rsi14 != null) {
+    if (ind.rsi14 >= 50 && ind.rsi14 <= 68) score += 8;
+    else if (ind.rsi14 > 75) score -= 8;
+    else if (ind.rsi14 < 35) score -= 8;
+  }
+  if (ind.kd_k != null && ind.kd_d != null) {
+    if (ind.kd_k > ind.kd_d && ind.kd_k < 85) score += 6;
+    else if (ind.kd_k < ind.kd_d && ind.kd_k > 15) score -= 6;
+  }
+  return { score: clamp(Math.round(score), 0, 100), label: score >= 65 ? '技術偏多' : score <= 40 ? '技術偏空' : '技術中性' };
+}
+
+function calcInstitutionScore(chip) {
+  if (!chip || !chip.enabled) return { score: 50, label: '法人資料不足' };
   const inst = chip.institutional || {};
-  addFlowScore(inst.foreign?.d1, 5);
-  addFlowScore(inst.foreign?.d5, 8);
-  addFlowScore(inst.trust?.d5, 7);
-  addFlowScore(inst.dealer?.d5, 4);
-  addFlowScore(inst.total?.d20, 8);
-  addFlowScore(chip.governmentBank?.d5, 4);
+  let score = 50;
+  score += scaledLotsScore(inst.foreign?.d5, 10);
+  score += scaledLotsScore(inst.trust?.d5, 14);
+  score += scaledLotsScore(inst.dealer?.d5, 5);
+  score += scaledLotsScore(inst.total?.d20, 12);
+  const foreign = toNumber(inst.foreign?.d5);
+  const trust = toNumber(inst.trust?.d5);
+  const label = trust > 0 && foreign > 0 ? '外資投信同步偏多'
+    : trust > 0 ? '投信偏多'
+    : foreign > 0 ? '外資偏多'
+    : trust < 0 && foreign < 0 ? '法人同步偏空'
+    : '法人中性';
+  return { score: clamp(Math.round(score), 0, 100), label };
+}
 
-  const buyNet = (chip.brokers?.buyTop || []).reduce((sum, row) => sum + Math.max(0, toNumber(row.net)), 0);
-  const sellNet = (chip.brokers?.sellTop || []).reduce((sum, row) => sum + Math.abs(Math.min(0, toNumber(row.net))), 0);
-  const brokerTotal = buyNet + sellNet;
-  if (brokerTotal > 0) {
-    const brokerWeight = chip.brokers?.concentration >= 55 ? 7 : 5;
-    bull += (buyNet / brokerTotal) * brokerWeight;
-    bear += (sellNet / brokerTotal) * brokerWeight;
+function calcBrokerStructureScore(chip) {
+  if (!chip || !chip.enabled) return { score: 50, label: '分點資料不足' };
+  const brokers = chip.brokers || {};
+  const buyNet = (brokers.buyTop || []).reduce((sum, row) => sum + Math.max(0, toNumber(row.net)), 0);
+  const sellNet = (brokers.sellTop || []).reduce((sum, row) => sum + Math.abs(Math.min(0, toNumber(row.net))), 0);
+  const total = buyNet + sellNet;
+  if (!total) return { score: 50, label: '分點無明顯方向' };
+  const buyRatio = buyNet / total;
+  let score = 50 + (buyRatio - 0.5) * 70;
+  const concentration = toNumber(brokers.concentration);
+  if (concentration >= 65 && buyRatio < 0.45) score -= 12;
+  if (concentration >= 65 && buyRatio > 0.58) score += 6;
+  const label = buyRatio >= 0.58 && concentration >= 45 ? '買方集中，偏吸籌'
+    : buyRatio <= 0.42 && concentration >= 45 ? '賣方集中，疑似出貨'
+    : buyRatio >= 0.55 ? '買方略強，健康換手'
+    : buyRatio <= 0.45 ? '賣方略強，換手偏弱'
+    : '買賣均衡，健康換手';
+  return { score: clamp(Math.round(score), 0, 100), label, buyRatio: Math.round(buyRatio * 100), concentration };
+}
+
+function calcForeignHoldingScore(chip) {
+  if (!chip || !chip.enabled || !chip.shareholding) return { score: 50, label: '外資持股資料不足' };
+  const inst = chip.institutional || {};
+  const foreignBuy = toNumber(inst.foreign?.d5);
+  const ratio = chip.shareholding.ratio;
+  let score = 50;
+  if (foreignBuy > 0) score += 8;
+  if (foreignBuy < 0) score -= 8;
+  if (ratio != null && ratio >= 20) score += 5;
+  const label = foreignBuy > 0 && ratio != null ? '外資買超，需觀察持股續增'
+    : foreignBuy > 0 ? '外資買超但持股待確認'
+    : foreignBuy < 0 ? '外資偏賣'
+    : '外資中性';
+  return { score: clamp(Math.round(score), 0, 100), label };
+}
+
+function calcGovernmentBankScore(chip) {
+  if (!chip || !chip.enabled) return { score: 50, label: '八大資料不足' };
+  const d5 = toNumber(chip.governmentBank?.d5);
+  const score = clamp(Math.round(50 + scaledLotsScore(d5, 18)), 0, 100);
+  const label = d5 > 0 ? '八大偏承接' : d5 < 0 ? '八大偏調節' : '八大中性';
+  return { score, label };
+}
+
+function calcVolumePriceScore(history) {
+  if (!history || history.length < 6) return { score: 50, label: '量價資料不足' };
+  const latest = history[history.length - 1];
+  const prev = history[history.length - 2];
+  const avg5Vol = history.slice(-6, -1).reduce((sum, row) => sum + row.volume, 0) / 5;
+  const priceUp = latest.close > prev.close;
+  const volumeRatio = avg5Vol ? latest.volume / avg5Vol : 1;
+  let score = 50;
+  if (priceUp && volumeRatio >= 1.2) score += 18;
+  else if (priceUp && volumeRatio < 0.8) score += 4;
+  else if (!priceUp && volumeRatio >= 1.2) score -= 18;
+  else if (!priceUp && volumeRatio < 0.8) score -= 4;
+  const label = priceUp && volumeRatio >= 1.2 ? '量增價漲'
+    : priceUp ? '價漲量縮'
+    : volumeRatio >= 1.2 ? '量增價跌'
+    : '量縮整理';
+  return { score: clamp(Math.round(score), 0, 100), label, volumeRatio };
+}
+
+function scaledLotsScore(value, maxScore) {
+  const lots = toNumber(value) / 1000;
+  if (!Number.isFinite(lots) || lots === 0) return 0;
+  return Math.sign(lots) * Math.min(Math.abs(lots) / 150, 1) * maxScore;
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function getAIScoreLabels(score, history, ind, chip) {
+  const trend = score.technical;
+  const inst = score.institution;
+  const broker = score.broker;
+  const gov = score.governmentBank;
+  const foreign = score.foreignHolding;
+  const volume = score.volumePrice;
+  const latest = history?.[history.length - 1] || {};
+  const prev = history?.[history.length - 2] || latest;
+  const foreignBuy = toNumber(chip?.institutional?.foreign?.d5);
+  const trustBuy = toNumber(chip?.institutional?.trust?.d5);
+  const govBuy = toNumber(chip?.governmentBank?.d5);
+  const priceUp = latest.close >= prev.close;
+  const strongVolume = (volume?.volumeRatio || 1) >= 1.3;
+
+  const attribution = judgeMoneyFlowAttribution(score, history, ind, chip);
+  const scenario = judgeMarketScenario({
+    trendScore: trend.score,
+    instScore: inst.score,
+    brokerScore: broker.score,
+    govScore: gov.score,
+    foreignScore: foreign.score,
+    foreignBuy,
+    trustBuy,
+    govBuy,
+    priceUp,
+    strongVolume,
+    close: latest.close,
+    ma5: ind?.ma5,
+    ma10: ind?.ma10,
+    ma20: ind?.ma20,
+  });
+
+  return {
+    chipScore: score.chipOverall,
+    mainForce: broker.label,
+    institution: inst.label,
+    broker: broker.label,
+    support: gov.label,
+    scenario: scenario.title,
+    detail: scenario.detail,
+    moneySource: attribution.source,
+    tradeStructure: attribution.structure,
+    attributionReason: attribution.reason,
+    risk: scenario.risk,
+    foreign: foreign.label,
+    volume: volume.label,
+  };
+}
+
+function judgeMoneyFlowAttribution(score, history, ind, chip) {
+  if (!chip || !chip.enabled) {
+    return {
+      source: '籌碼資料不足',
+      structure: '等待資料',
+      reason: '尚未取得法人、分點與外資持股資料。',
+    };
   }
 
-  return { bull, bear };
+  const latest = history?.[history.length - 1] || {};
+  const prev = history?.[history.length - 2] || latest;
+  const priceUp = latest.close >= prev.close;
+  const volumeRatio = score.volumePrice?.volumeRatio || 1;
+  const strongVolume = volumeRatio >= 1.25;
+  const aboveMa5 = ind?.ma5 && latest.close >= ind.ma5;
+  const aboveMa10 = ind?.ma10 && latest.close >= ind.ma10;
+  const foreignBuy = toNumber(chip.institutional?.foreign?.d5);
+  const trustBuy = toNumber(chip.institutional?.trust?.d5);
+  const dealerBuy = toNumber(chip.institutional?.dealer?.d5);
+  const totalInst = toNumber(chip.institutional?.total?.d5);
+  const govBuy = toNumber(chip.governmentBank?.d5);
+  const brokerScore = score.broker?.score || 50;
+  const brokerBuyRatio = score.broker?.buyRatio || 50;
+  const concentration = score.broker?.concentration || 0;
+  const foreignHoldingScore = score.foreignHolding?.score || 50;
+
+  let source = '中性換手';
+  if (trustBuy > 0 && aboveMa5 && aboveMa10) source = '投信主導';
+  else if (foreignBuy > 0 && foreignHoldingScore >= 55) source = '外資主導';
+  else if (brokerScore >= 60 && concentration >= 45) source = '主力分點主導';
+  else if (priceUp && strongVolume && totalInst <= 0 && brokerBuyRatio < 50) source = '散戶追價 / 主力調節';
+  else if (!priceUp && totalInst < 0 && brokerScore < 45) source = '賣壓主導';
+  else if (govBuy > 0 && !priceUp) source = '官股承接';
+  else if (foreignBuy > 0 || trustBuy > 0 || dealerBuy > 0) source = '法人偏買';
+
+  let structure = '健康換手';
+  if (priceUp && strongVolume && brokerScore >= 60 && totalInst > 0) structure = '吃貨攻擊';
+  else if (priceUp && strongVolume && brokerScore < 45 && totalInst <= 0) structure = '拉高出貨';
+  else if (!priceUp && strongVolume && brokerScore < 45 && totalInst < 0) structure = '倒貨';
+  else if (!priceUp && volumeRatio < 1.1 && (foreignBuy > 0 || trustBuy > 0 || govBuy > 0)) structure = '洗盤換手';
+  else if (priceUp && brokerScore >= 55 && totalInst >= 0) structure = '健康換手';
+  else if (priceUp && totalInst <= 0 && brokerScore <= 50) structure = '追價風險';
+
+  const reason = [
+    priceUp ? '股價上漲' : '股價回檔',
+    strongVolume ? '量能放大' : '量能未明顯放大',
+    foreignBuy > 0 ? '外資5日偏買' : foreignBuy < 0 ? '外資5日偏賣' : '外資中性',
+    trustBuy > 0 ? '投信5日偏買' : trustBuy < 0 ? '投信5日偏賣' : '投信中性',
+    brokerScore >= 60 ? '分點買方占優' : brokerScore <= 45 ? '分點賣方占優' : '分點均衡',
+    govBuy > 0 ? '八大承接' : govBuy < 0 ? '八大調節' : '八大中性',
+  ].join('、');
+
+  return { source, structure, reason };
+}
+
+function judgeMarketScenario(ctx) {
+  const aboveShortMa = ctx.ma5 && ctx.close >= ctx.ma5;
+  const aboveTrendMa = ctx.ma20 && ctx.close >= ctx.ma20;
+
+  if (ctx.priceUp && ctx.strongVolume && ctx.instScore < 48 && ctx.brokerScore < 45) {
+    return {
+      title: '假突破 / 主力出貨風險',
+      detail: '量增價漲但法人未同步，分點偏賣，可能是拉高換手或出貨。',
+      risk: '若隔日跌破5日線或爆量收黑，需防短線倒貨。',
+    };
+  }
+
+  if (!ctx.priceUp && ctx.foreignBuy > 0 && ctx.trustBuy > 0 && ctx.brokerScore >= 50 && ctx.govBuy >= 0) {
+    return {
+      title: '洗盤換手',
+      detail: '股價回檔但外資/投信仍偏買，分點未明顯出貨，八大也有承接。',
+      risk: '仍需守住10日或20日線，否則換手可能轉弱。',
+    };
+  }
+
+  if (ctx.trustBuy > 0 && aboveShortMa && ctx.trendScore >= 60) {
+    return {
+      title: '投信作帳行情',
+      detail: '投信連買且股價沿短均上攻，籌碼與趨勢同向。',
+      risk: '若投信買超縮小或跌破10日線，作帳動能可能降溫。',
+    };
+  }
+
+  if (!ctx.priceUp && ctx.govBuy > 0) {
+    return {
+      title: '下跌有承接',
+      detail: '股價走弱但八大行庫或官股資金偏買，可能有承接力道。',
+      risk: '承接不等於立即轉強，需等價格重新站回短均。',
+    };
+  }
+
+  if (ctx.priceUp && ctx.strongVolume && ctx.instScore >= 60 && ctx.brokerScore >= 58 && aboveTrendMa) {
+    return {
+      title: '突破可信度較高',
+      detail: '量價突破時法人與主力分點同步偏多，突破品質較佳。',
+      risk: '短線漲幅若過大，仍要留意隔日沖與獲利了結。',
+    };
+  }
+
+  if (ctx.foreignBuy > 0 && ctx.foreignScore <= 55) {
+    return {
+      title: '外資真買待確認',
+      detail: '外資買超但持股變化訊號不強，可能含交易部位或短線調整。',
+      risk: '需觀察外資持股是否連續增加。',
+    };
+  }
+
+  return {
+    title: ctx.trendScore >= 60 ? '偏多但需確認籌碼' : ctx.trendScore <= 40 ? '偏空觀察承接' : '中性換手',
+    detail: '目前訊號未完全同步，需搭配法人、分點、量價與均線位置確認。',
+    risk: '不要只看單一籌碼訊號，需避免被外資套利、分倉或隔日沖誤導。',
+  };
 }
 
 
@@ -796,6 +1048,202 @@ function chipValueClass(value) {
   return n > 0 ? 'up' : n < 0 ? 'dn' : '';
 }
 
+function calcMarginShortInsight(chip, history) {
+  const margin = chip?.margin;
+  if (!margin) {
+    return { label: '資券資料不足', detail: '尚未取得融資融券資料', riskScore: 0 };
+  }
+  const latest = history?.[history.length - 1] || {};
+  const prev = history?.[history.length - 2] || latest;
+  const priceUp = latest.close >= prev.close;
+  const marginBalance = toNumber(margin.marginBalance);
+  const shortBalance = toNumber(margin.shortBalance);
+  const marginHot = marginBalance > 0;
+  const shortHot = shortBalance > 0;
+  let label = '資券中性';
+  let detail = '融資融券未出現明顯極端訊號';
+  let riskScore = 0;
+
+  if (priceUp && marginHot && !shortHot) {
+    label = '散戶追高';
+    detail = '股價上漲且融資偏高，偏多但籌碼浮動，需防震盪洗融資';
+    riskScore = 8;
+  } else if (priceUp && !marginHot && shortHot) {
+    label = '軋空潛力';
+    detail = '股價上漲且融券偏高，若續強可能引發空方回補';
+    riskScore = -4;
+  } else if (!priceUp && marginHot) {
+    label = '攤平 / 斷頭風險';
+    detail = '股價下跌但融資仍高，可能有散戶攤平與後續斷頭賣壓';
+    riskScore = 12;
+  } else if (!priceUp && shortHot) {
+    label = '空方升溫';
+    detail = '股價下跌且融券偏高，空方壓力仍在，但需留意回補反彈';
+    riskScore = 6;
+  } else if (priceUp && !marginHot) {
+    label = '籌碼較健康';
+    detail = '股價上漲但融資未明顯升溫，較不像散戶槓桿硬追';
+    riskScore = -5;
+  }
+
+  return { label, detail, riskScore, marginBalance, shortBalance };
+}
+
+function buildTacticalView(history, ind, score, labels) {
+  const latest = history[history.length - 1] || {};
+  const prev = history[history.length - 2] || latest;
+  const recent20 = history.slice(-20);
+  const recent60 = history.slice(-60);
+  const highs20 = recent20.map(row => row.high).filter(Number.isFinite);
+  const lows20 = recent20.map(row => row.low).filter(Number.isFinite);
+  const highs60 = recent60.map(row => row.high).filter(Number.isFinite);
+  const lows60 = recent60.map(row => row.low).filter(Number.isFinite);
+  const recentHigh = Math.max(...highs20, latest.high || 0);
+  const recentLow = Math.min(...lows20, latest.low || latest.close || 0);
+  const swingHigh = Math.max(...highs60, recentHigh);
+  const swingLow = Math.min(...lows60, recentLow);
+  const close = latest.close || 0;
+  const pressureLow = round2(Math.max(recentHigh * 0.99, close * 1.01));
+  const pressureHigh = round2(Math.max(recentHigh, close * 1.04));
+  const supportLow = round2(Math.min(ind.ma20 || close * 0.96, close * 0.97));
+  const supportHigh = round2(Math.max(ind.ma20 || close * 0.96, close * 0.985));
+  const strongSupportLow = round2(Math.min(ind.ma60 || swingLow, swingLow * 1.03));
+  const strongSupportHigh = round2(Math.max(ind.ma60 || swingLow, swingLow * 1.08));
+  const stopLoss = round2(Math.min(supportLow * 0.985, close * 0.94));
+  const breakoutTarget = round2(pressureHigh + Math.max(pressureHigh - supportLow, close * 0.04));
+  const pullbackTarget = round2(supportLow);
+  const weakTarget = round2(Math.max(strongSupportLow, stopLoss * 0.94));
+  const winRate = calcShortTermWinRate(score, ind, history);
+  const warnings = buildRiskWarnings(history, ind, score, labels);
+  const summary = buildFocusSummary(score, labels, ind, history);
+
+  return {
+    keyPrices: { pressureLow, pressureHigh, supportLow, supportHigh, strongSupportLow, strongSupportHigh, stopLoss },
+    paths: {
+      up: `突破 ${pressureHigh} 後，挑戰 ${breakoutTarget}`,
+      pullback: `跌破 ${supportLow}，回測 ${strongSupportLow} ~ ${strongSupportHigh}`,
+      weak: `跌破 ${stopLoss}，轉弱看 ${weakTarget}`,
+    },
+    winRate,
+    warnings,
+    summary,
+  };
+}
+
+function calcShortTermWinRate(score, ind, history) {
+  let rate = score?.total || 50;
+  const latest = history[history.length - 1] || {};
+  if (score?.marginShort?.riskScore) rate -= Math.max(0, Math.round(score.marginShort.riskScore / 2));
+  if (ind.rsi14 > 75) rate -= 8;
+  if (ind.kd_k > 85) rate -= 6;
+  if (score?.volumePrice?.volumeRatio >= 1.8 && latest.close > latest.open) rate -= 3;
+  if (score?.broker?.score >= 60 && score?.institution?.score >= 60) rate += 6;
+  if (score?.broker?.score <= 40 && score?.institution?.score <= 45) rate -= 8;
+  return clamp(Math.round(rate), 5, 95);
+}
+
+function buildRiskWarnings(history, ind, score, labels) {
+  const latest = history[history.length - 1] || {};
+  const prev = history[history.length - 2] || latest;
+  const warnings = [];
+  const dayChangePct = prev.close ? (latest.close - prev.close) / prev.close * 100 : 0;
+  if (dayChangePct >= 7) warnings.push('單日漲幅偏大，追高風險升高');
+  if (score?.volumePrice?.volumeRatio >= 1.8) warnings.push('爆量，需確認是攻擊量或出貨量');
+  if (ind.rsi14 >= 70 || ind.kd_k >= 85) warnings.push('RSI/KD 過熱，短線易震盪');
+  if (score?.institution?.score < 50 && score?.broker?.score < 50) warnings.push('法人與分點不同步，突破可信度下降');
+  if (labels?.tradeStructure === '拉高出貨' || labels?.tradeStructure === '倒貨') warnings.push('買賣結構偏風險，需防主力調節');
+  if (score?.marginShort?.riskScore >= 8) warnings.push(score.marginShort.detail);
+  if (score?.marginShort?.label === '軋空潛力') warnings.push('融券偏高且股價走強，若續漲可能出現軋空回補');
+  if (!warnings.length) warnings.push('暫無明顯高風險訊號，仍需依支撐停損控管');
+  return warnings;
+}
+
+function buildFocusSummary(score, labels, ind, history) {
+  const trend = score?.technical?.score >= 65 ? '偏強' : score?.technical?.score <= 40 ? '偏弱' : '震盪';
+  const technical = ind.rsi14 >= 70 || ind.kd_k >= 85 ? '過熱' : score?.technical?.score >= 60 ? '健康' : score?.technical?.score <= 40 ? '轉弱' : '觀察';
+  const chip = labels?.tradeStructure || labels?.mainForce || '待確認';
+  const difficulty = (technical === '過熱' || labels?.tradeStructure === '拉高出貨' || labels?.tradeStructure === '倒貨') ? '偏高'
+    : score?.total >= 65 ? '中' : '中高';
+  return { trend, technical, chip, difficulty };
+}
+
+function renderTacticalPanels(tactical) {
+  if (!tactical) return '';
+  const box = (title, value, note = '') => `
+    <div class="strategy-box">
+      <div class="label">${title}</div>
+      <div class="value">${value}</div>
+      ${note ? `<div style="font-size:11px;color:var(--text-2);margin-top:4px;line-height:1.5;">${note}</div>` : ''}
+    </div>`;
+  return `
+    <div class="grid">
+      <div class="panel">
+        <div class="panel-title">🎯 關鍵價位</div>
+        <div class="strategy-grid">
+          ${box('壓力區', `${tactical.keyPrices.pressureLow} ~ ${tactical.keyPrices.pressureHigh}`)}
+          ${box('支撐區', `${tactical.keyPrices.supportLow} ~ ${tactical.keyPrices.supportHigh}`)}
+          ${box('強支撐', `${tactical.keyPrices.strongSupportLow} ~ ${tactical.keyPrices.strongSupportHigh}`)}
+          ${box('停損價', tactical.keyPrices.stopLoss)}
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">🧭 可能路徑</div>
+        <div class="strategy-grid">
+          ${box('上漲', '突破', tactical.paths.up)}
+          ${box('回檔', '測支撐', tactical.paths.pullback)}
+          ${box('轉弱', '跌破停損', tactical.paths.weak)}
+        </div>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="panel">
+        <div class="panel-title">📈 短線進場勝率</div>
+        <div style="font-size:38px;font-weight:700;color:${tactical.winRate >= 60 ? 'var(--up)' : tactical.winRate <= 45 ? 'var(--dn)' : 'var(--gold)'};">${tactical.winRate}%</div>
+        <div style="font-size:12px;color:var(--text-2);margin-top:4px;">由技術、籌碼、分點與量價結構加權估算</div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">⚠ 風險提醒 / 重點總結</div>
+        <div style="font-size:12px;color:var(--text-1);line-height:1.8;">
+          ${tactical.warnings.map(item => `<div>• ${item}</div>`).join('')}
+        </div>
+        <div class="strategy-grid" style="margin-top:12px;">
+          ${box('趨勢', tactical.summary.trend)}
+          ${box('技術', tactical.summary.technical)}
+          ${box('籌碼', tactical.summary.chip)}
+          ${box('難度', tactical.summary.difficulty)}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderAIScorePanel(score, labels) {
+  if (!score) return '';
+  const item = (title, value, note) => `
+    <div class="strategy-box">
+      <div class="label">${title}</div>
+      <div class="value">${value}</div>
+      <div style="font-size:11px;color:var(--text-2);margin-top:4px;line-height:1.5;">${note}</div>
+    </div>`;
+  return `
+    <div class="strategy-grid" style="margin-bottom:12px;">
+      ${item('AI 多空評分', score.total + ' / 100', '技術30% 法人25% 分點25% 持股10% 八大10%')}
+      ${item('籌碼評分', labels.chipScore + ' / 100', labels.mainForce)}
+      ${item('情境判斷', labels.scenario, labels.detail)}
+      ${item('資金歸因', labels.moneySource, labels.attributionReason)}
+      ${item('買賣結構', labels.tradeStructure, '吃貨 / 健康換手 / 洗盤 / 拉高出貨 / 倒貨')}
+      ${item('法人態度', labels.institution, score.institution.label)}
+      ${item('主力分點', labels.broker, '主力出貨 vs 健康換手')}
+      ${item('外資判斷', labels.foreign, '真買 / 交易部位需搭配持股變化')}
+      ${item('下跌承接', labels.support, score.governmentBank.label)}
+      ${item('量價技術', labels.volume, score.technical.label)}
+      ${item('融資融券', score.marginShort.label, score.marginShort.detail)}
+      ${item('風險提示', labels.risk, '籌碼資料可能受套利、ETF、分倉、隔日沖影響')}
+    </div>
+  `;
+}
+
+
 function renderChipDataPanel(chip) {
   if (!chip || !chip.enabled) {
     return `
@@ -942,6 +1390,8 @@ function renderDashboard(stock, history, chip = null) {
   const candle = detectCandle(history);
   const signals = generateSignals(latest, indicators);
   const aiProb = calcAIProbability(history, indicators, chip);
+  const aiLabels = getAIScoreLabels(aiProb.breakdown, history, indicators, chip);
+  const tactical = buildTacticalView(history, indicators, aiProb.breakdown, aiLabels);
 
   const amp = round2((latest.high - latest.low) / prev.close * 100);
   const upLimit = round2(prev.close * 1.10);
@@ -1071,6 +1521,8 @@ function renderDashboard(stock, history, chip = null) {
       <div id="aiAnalysis" class="ai-text loading">${hasGemini ? '🤖 AI 正在分析中...' : '💡 設定 Gemini API Key 即可啟用 AI 趨勢分析（免費）'}</div>
     </div>
 
+    ${renderTacticalPanels(tactical)}
+
     <div class="grid">
       <div class="panel">
         <div class="panel-title">🎯 操作策略</div>
@@ -1085,6 +1537,7 @@ function renderDashboard(stock, history, chip = null) {
           <span>🏦 法人籌碼 / 分點</span>
           <span class="badge">${chip?.enabled ? 'FinMind' : '未設定 Token'}</span>
         </div>
+        ${renderAIScorePanel(aiProb.breakdown, aiLabels)}
         ${renderChipDataPanel(chip)}
       </div>
     </div>
@@ -1125,9 +1578,11 @@ function fmt(v, digits = 2) {
   return v.toFixed(digits);
 }
 function formatVolume(v) {
-  if (v >= 100000000) return (v / 100000000).toFixed(1) + '億';
-  if (v >= 10000) return (v / 10000).toFixed(0) + '萬';
-  return v.toString();
+  const shares = Number(v) || 0;
+  if (shares >= 1000) {
+    return (shares / 1000).toLocaleString('zh-TW', { maximumFractionDigits: 0 }) + '張';
+  }
+  return shares.toLocaleString('zh-TW', { maximumFractionDigits: 0 }) + '股';
 }
 
 function renderStrategy(latest, ind, history) {
