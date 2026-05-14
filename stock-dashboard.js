@@ -471,6 +471,7 @@ function calcAIScoreBreakdown(history, ind, chip = null) {
   const foreignHolding = calcForeignHoldingScore(chip);
   const governmentBank = calcGovernmentBankScore(chip);
   const volumePrice = calcVolumePriceScore(history);
+  const marginShort = calcMarginShortInsight(chip, history);
 
   const total = clamp(Math.round(
     technical.score * 0.30 +
@@ -488,6 +489,7 @@ function calcAIScoreBreakdown(history, ind, chip = null) {
     foreignHolding,
     governmentBank,
     volumePrice,
+    marginShort,
     chipOverall: clamp(Math.round(
       institution.score * 0.35 +
       broker.score * 0.35 +
@@ -1046,6 +1048,47 @@ function chipValueClass(value) {
   return n > 0 ? 'up' : n < 0 ? 'dn' : '';
 }
 
+function calcMarginShortInsight(chip, history) {
+  const margin = chip?.margin;
+  if (!margin) {
+    return { label: '資券資料不足', detail: '尚未取得融資融券資料', riskScore: 0 };
+  }
+  const latest = history?.[history.length - 1] || {};
+  const prev = history?.[history.length - 2] || latest;
+  const priceUp = latest.close >= prev.close;
+  const marginBalance = toNumber(margin.marginBalance);
+  const shortBalance = toNumber(margin.shortBalance);
+  const marginHot = marginBalance > 0;
+  const shortHot = shortBalance > 0;
+  let label = '資券中性';
+  let detail = '融資融券未出現明顯極端訊號';
+  let riskScore = 0;
+
+  if (priceUp && marginHot && !shortHot) {
+    label = '散戶追高';
+    detail = '股價上漲且融資偏高，偏多但籌碼浮動，需防震盪洗融資';
+    riskScore = 8;
+  } else if (priceUp && !marginHot && shortHot) {
+    label = '軋空潛力';
+    detail = '股價上漲且融券偏高，若續強可能引發空方回補';
+    riskScore = -4;
+  } else if (!priceUp && marginHot) {
+    label = '攤平 / 斷頭風險';
+    detail = '股價下跌但融資仍高，可能有散戶攤平與後續斷頭賣壓';
+    riskScore = 12;
+  } else if (!priceUp && shortHot) {
+    label = '空方升溫';
+    detail = '股價下跌且融券偏高，空方壓力仍在，但需留意回補反彈';
+    riskScore = 6;
+  } else if (priceUp && !marginHot) {
+    label = '籌碼較健康';
+    detail = '股價上漲但融資未明顯升溫，較不像散戶槓桿硬追';
+    riskScore = -5;
+  }
+
+  return { label, detail, riskScore, marginBalance, shortBalance };
+}
+
 function buildTacticalView(history, ind, score, labels) {
   const latest = history[history.length - 1] || {};
   const prev = history[history.length - 2] || latest;
@@ -1090,6 +1133,7 @@ function buildTacticalView(history, ind, score, labels) {
 function calcShortTermWinRate(score, ind, history) {
   let rate = score?.total || 50;
   const latest = history[history.length - 1] || {};
+  if (score?.marginShort?.riskScore) rate -= Math.max(0, Math.round(score.marginShort.riskScore / 2));
   if (ind.rsi14 > 75) rate -= 8;
   if (ind.kd_k > 85) rate -= 6;
   if (score?.volumePrice?.volumeRatio >= 1.8 && latest.close > latest.open) rate -= 3;
@@ -1108,6 +1152,8 @@ function buildRiskWarnings(history, ind, score, labels) {
   if (ind.rsi14 >= 70 || ind.kd_k >= 85) warnings.push('RSI/KD 過熱，短線易震盪');
   if (score?.institution?.score < 50 && score?.broker?.score < 50) warnings.push('法人與分點不同步，突破可信度下降');
   if (labels?.tradeStructure === '拉高出貨' || labels?.tradeStructure === '倒貨') warnings.push('買賣結構偏風險，需防主力調節');
+  if (score?.marginShort?.riskScore >= 8) warnings.push(score.marginShort.detail);
+  if (score?.marginShort?.label === '軋空潛力') warnings.push('融券偏高且股價走強，若續漲可能出現軋空回補');
   if (!warnings.length) warnings.push('暫無明顯高風險訊號，仍需依支撐停損控管');
   return warnings;
 }
@@ -1191,6 +1237,7 @@ function renderAIScorePanel(score, labels) {
       ${item('外資判斷', labels.foreign, '真買 / 交易部位需搭配持股變化')}
       ${item('下跌承接', labels.support, score.governmentBank.label)}
       ${item('量價技術', labels.volume, score.technical.label)}
+      ${item('融資融券', score.marginShort.label, score.marginShort.detail)}
       ${item('風險提示', labels.risk, '籌碼資料可能受套利、ETF、分倉、隔日沖影響')}
     </div>
   `;
