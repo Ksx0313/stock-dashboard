@@ -1953,6 +1953,7 @@ async function fetchStockNews(code, stockName = '') {
     return {
       enabled: true,
       status: items.length ? '新聞已載入' : '查無近期新聞',
+      searchUrl: json.searchUrl || `https://news.google.com/search?q=${encodeURIComponent(keyword)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant`,
       items,
     };
   } catch (err) {
@@ -1995,7 +1996,7 @@ function renderFundamentalNewsPanel(fundamental, news) {
               <div style="font-size:13px;font-weight:600;line-height:1.5;">${escapeHtml(item.title)}</div>
               <div style="font-size:11px;color:var(--text-2);margin-top:3px;">${escapeHtml(item.source || '')} · ${escapeHtml(item.pubDate || '')}</div>
             </a>
-          `).join('') : `<div style="font-size:12px;color:var(--text-2);">${news?.status || '無新聞資料'}</div>`}
+          `).join('') : `<div style="font-size:12px;color:var(--text-2);">${news?.status || '無新聞資料'}${news?.searchUrl ? ` · <a href="${news.searchUrl}" target="_blank" rel="noopener" style="color:var(--blue);">開啟 Google News</a>` : ''}</div>`}
         </div>
       </div>
     </div>
