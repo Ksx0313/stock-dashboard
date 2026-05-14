@@ -27,6 +27,203 @@ let WATCH_LIST = loadWatchList();
 let currentStock = null;
 let priceChart = null;
 let chartRange = '4mo';
+let pendingAIAnalysis = null;
+
+function getStockGroup(stock) {
+  return stock.group || '未分類';
+}
+
+function getAllGroups() {
+  return [...new Set(WATCH_LIST.map(getStockGroup))].sort((a, b) => a.localeCompare(b, 'zh-TW'));
+}
+
+function getAlerts() {
+  try { return JSON.parse(localStorage.getItem('priceAlerts') || '{}'); }
+  catch(e) { return {}; }
+}
+
+function saveAlerts(alerts) {
+  localStorage.setItem('priceAlerts', JSON.stringify(alerts));
+}
+
+function setStockAlert(code, target, direction) {
+  const alerts = getAlerts();
+  if (!target) delete alerts[code];
+  else alerts[code] = { target: Number(target), direction, triggered: false };
+  saveAlerts(alerts);
+}
+
+function checkPriceAlert(code, price) {
+  const alerts = getAlerts();
+  const alert = alerts[code];
+  if (!alert || alert.triggered || !Number.isFinite(price)) return;
+  const hit = alert.direction === 'below' ? price <= alert.target : price >= alert.target;
+  if (!hit) return;
+  alert.triggered = true;
+  alerts[code] = alert;
+  saveAlerts(alerts);
+  const msg = `${code} 已${alert.direction === 'below' ? '跌破' : '突破'}目標價 ${alert.target}，目前 ${price.toFixed(2)}`;
+  showToast(msg, 'success');
+  if ('Notification' in window && Notification.permission === 'granted') {
+    new Notification('價格警示', { body: msg });
+  } else if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+}
+
+function moveWatchItem(fromIndex, toIndex) {
+  if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return;
+  const [item] = WATCH_LIST.splice(fromIndex, 1);
+  WATCH_LIST.splice(toIndex, 0, item);
+  saveWatchList();
+  renderWatchlist();
+  loadAllWatchlistPrices();
+}
+
+function buildGroupOptions(selected = '未分類') {
+  const groups = getAllGroups();
+  if (!groups.includes('未分類')) groups.unshift('未分類');
+  return groups.map(group => `<option value="${group}" ${group === selected ? 'selected' : ''}>${group}</option>`).join('');
+}
+
+function showGroupModal() {
+  document.getElementById('groupModal').classList.add('show');
+  renderGroupEditor();
+}
+
+function hideGroupModal() {
+  document.getElementById('groupModal').classList.remove('show');
+}
+
+function renderGroupEditor() {
+  const el = document.getElementById('groupEditor');
+  if (!el) return;
+  el.innerHTML = WATCH_LIST.map((stock, index) => `
+    <div class="group-editor-row">
+      <span>${stock.code} ${stock.name || ''}</span>
+      <select data-group-index="${index}">${buildGroupOptions(getStockGroup(stock))}</select>
+    </div>
+  `).join('');
+}
+
+function saveGroupEditor() {
+  document.querySelectorAll('[data-group-index]').forEach(select => {
+    const index = Number(select.dataset.groupIndex);
+    if (WATCH_LIST[index]) WATCH_LIST[index].group = select.value || '未分類';
+  });
+  saveWatchList();
+  hideGroupModal();
+  renderWatchlist();
+  loadAllWatchlistPrices();
+}
+
+function addNewGroup() {
+  const input = document.getElementById('newGroupName');
+  const name = input.value.trim();
+  if (!name) return;
+  WATCH_LIST.forEach(stock => { if (!stock.group) stock.group = '未分類'; });
+  input.value = '';
+  const first = WATCH_LIST.find(stock => getStockGroup(stock) === '未分類');
+  if (first) first.group = name;
+  saveWatchList();
+  renderGroupEditor();
+}
+
+function showAlertModal(code) {
+  const stock = WATCH_LIST.find(s => s.code === code) || currentStock || { code };
+  const alert = getAlerts()[code] || {};
+  document.getElementById('alertCode').value = code;
+  document.getElementById('alertStockLabel').textContent = `${code} ${stock.name || ''}`;
+  document.getElementById('alertTarget').value = alert.target || '';
+  document.getElementById('alertDirection').value = alert.direction || 'above';
+  document.getElementById('alertModal').classList.add('show');
+}
+
+function hideAlertModal() {
+  document.getElementById('alertModal').classList.remove('show');
+}
+
+function saveAlertModal() {
+  const code = document.getElementById('alertCode').value;
+  const target = document.getElementById('alertTarget').value;
+  const direction = document.getElementById('alertDirection').value;
+  setStockAlert(code, target, direction);
+  hideAlertModal();
+  renderWatchlist();
+  loadAllWatchlistPrices();
+}
+
+function clearAlertModal() {
+  const code = document.getElementById('alertCode').value;
+  setStockAlert(code, '', 'above');
+  hideAlertModal();
+  renderWatchlist();
+}
+
+function showCompareModal() {
+  document.getElementById('compareModal').classList.add('show');
+  renderComparePicker();
+}
+
+function hideCompareModal() {
+  document.getElementById('compareModal').classList.remove('show');
+}
+
+function renderComparePicker() {
+  const el = document.getElementById('comparePicker');
+  if (!el) return;
+  el.innerHTML = WATCH_LIST.map((stock, index) => `
+    <label class="compare-check">
+      <input type="checkbox" value="${index}" ${index < 4 ? 'checked' : ''}>
+      <span>${stock.code} ${stock.name || ''}</span>
+    </label>
+  `).join('');
+}
+
+async function renderCompareChart() {
+  const canvas = document.getElementById('compareChart');
+  if (!canvas) return;
+  const selected = [...document.querySelectorAll('#comparePicker input:checked')]
+    .map(input => WATCH_LIST[Number(input.value)])
+    .filter(Boolean)
+    .slice(0, 8);
+  if (!selected.length) {
+    showToast('請至少選一檔股票', 'error');
+    return;
+  }
+  const datasets = [];
+  let labels = [];
+  const colors = ['#3b82f6', '#ef4444', '#10b981', '#fbbf24', '#a78bfa', '#14b8a6', '#ec4899', '#f97316'];
+  for (let i = 0; i < selected.length; i++) {
+    const stock = selected[i];
+    const history = await fetchYahooHistory(stock.code, stock.type, '3mo');
+    if (!history || history.length < 2) continue;
+    if (!labels.length) labels = history.map(row => row.date.slice(5));
+    const base = history[0].close || 1;
+    datasets.push({
+      label: `${stock.code} ${stock.name || ''}`,
+      data: history.map(row => round2((row.close / base - 1) * 100)),
+      borderColor: colors[i % colors.length],
+      backgroundColor: colors[i % colors.length],
+      tension: 0.25,
+      pointRadius: 0,
+    });
+  }
+  if (window.compareChartInstance) window.compareChartInstance.destroy();
+  window.compareChartInstance = new Chart(canvas, {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#e4e7eb' } } },
+      scales: {
+        x: { ticks: { color: '#9ca3af', maxTicksLimit: 8 }, grid: { color: '#1f2937' } },
+        y: { ticks: { color: '#9ca3af', callback: v => v + '%' }, grid: { color: '#1f2937' } },
+      },
+    },
+  });
+}
 
 function loadWatchList() {
   try {
@@ -48,7 +245,7 @@ window.addEventListener('DOMContentLoaded', () => {
   bindEvents();
   loadAllWatchlistPrices();
 
-  if (!localStorage.getItem('geminiApiKey') && !localStorage.getItem('apiKeyDismissed')) {
+  if (!localStorage.getItem('geminiApiKey') && !localStorage.getItem('claudeApiKey') && !localStorage.getItem('apiKeyDismissed')) {
     showApiKeyModal();
   }
 });
@@ -64,6 +261,19 @@ function bindEvents() {
     }
   });
   document.getElementById('refreshAllBtn').addEventListener('click', loadAllWatchlistPrices);
+  document.getElementById('groupBtn')?.addEventListener('click', showGroupModal);
+  document.getElementById('compareLink')?.addEventListener('click', showCompareModal);
+  document.getElementById('groupCancelBtn')?.addEventListener('click', hideGroupModal);
+  document.getElementById('groupSaveBtn')?.addEventListener('click', saveGroupEditor);
+  document.getElementById('newGroupBtn')?.addEventListener('click', addNewGroup);
+  document.getElementById('alertCancelBtn')?.addEventListener('click', hideAlertModal);
+  document.getElementById('alertSaveBtn')?.addEventListener('click', saveAlertModal);
+  document.getElementById('alertClearBtn')?.addEventListener('click', clearAlertModal);
+  document.getElementById('compareCancelBtn')?.addEventListener('click', hideCompareModal);
+  document.getElementById('compareRenderBtn')?.addEventListener('click', renderCompareChart);
+  document.addEventListener('click', e => {
+    if (e.target && e.target.id === 'generateAiBtn') generateCurrentAIAnalysis();
+  });
   document.getElementById('settingsLink').addEventListener('click', showApiKeyModal);
   document.getElementById('apiKeySaveBtn').addEventListener('click', saveApiKey);
   document.getElementById('apiKeyCancelBtn').addEventListener('click', () => {
@@ -87,25 +297,54 @@ function bindEvents() {
 function renderWatchlist() {
   const c = document.getElementById('watchlistContainer');
   if (WATCH_LIST.length === 0) {
-    c.innerHTML = `<div class="watchlist-empty">
-      📌 監控清單是空的<br>
-      點上方「＋」新增股票
-    </div>`;
+    c.innerHTML = `<div class="watchlist-empty">📌 監控清單是空的<br>點上方「＋」新增股票</div>`;
     return;
   }
-  c.innerHTML = WATCH_LIST.map((s, i) => `
-    <div class="stock-item" data-index="${i}">
-      <div class="stock-info" onclick="loadStock(WATCH_LIST[${i}])">
-        <div class="stock-code">${s.code}</div>
-        <div class="stock-name">${s.name || '—'}</div>
-      </div>
-      <div class="stock-price loading" id="wl-${s.code}">
-        <div class="stock-price-val">—</div>
-        <div class="stock-price-chg">—</div>
-      </div>
-      <button class="stock-delete" onclick="deleteStockFromList(${i})" title="移除">✕</button>
-    </div>
-  `).join('');
+  const alerts = getAlerts();
+  const groups = getAllGroups();
+  c.innerHTML = groups.map(group => {
+    const items = WATCH_LIST
+      .map((stock, index) => ({ stock, index }))
+      .filter(item => getStockGroup(item.stock) === group);
+    if (!items.length) return '';
+    return `
+      <div class="watch-group">
+        <div class="watch-group-title">${group}</div>
+        ${items.map(({ stock: s, index: i }) => {
+          const alert = alerts[s.code];
+          return `
+            <div class="stock-item" data-index="${i}" draggable="true">
+              <div class="drag-handle" title="拖曳排序">⋮⋮</div>
+              <div class="stock-info" onclick="loadStock(WATCH_LIST[${i}])">
+                <div class="stock-code">${s.code} ${alert ? '<span class="alert-dot">●</span>' : ''}</div>
+                <div class="stock-name">${s.name || '未命名'}</div>
+              </div>
+              <div class="stock-price loading" id="wl-${s.code}">
+                <div class="stock-price-val">--</div>
+                <div class="stock-price-chg">--</div>
+              </div>
+              <button class="stock-alert" onclick="event.stopPropagation(); showAlertModal('${s.code}')" title="價格警示">🔔</button>
+              <button class="stock-delete" onclick="deleteStockFromList(${i})" title="刪除">×</button>
+            </div>`;
+        }).join('')}
+      </div>`;
+  }).join('');
+  bindWatchlistDrag();
+}
+
+function bindWatchlistDrag() {
+  document.querySelectorAll('.stock-item[draggable="true"]').forEach(item => {
+    item.addEventListener('dragstart', e => {
+      e.dataTransfer.setData('text/plain', item.dataset.index);
+      item.classList.add('dragging');
+    });
+    item.addEventListener('dragend', () => item.classList.remove('dragging'));
+    item.addEventListener('dragover', e => e.preventDefault());
+    item.addEventListener('drop', e => {
+      e.preventDefault();
+      moveWatchItem(Number(e.dataTransfer.getData('text/plain')), Number(item.dataset.index));
+    });
+  });
 }
 
 function deleteStockFromList(index) {
@@ -149,7 +388,7 @@ async function handleAddStock() {
   // 自動判斷上市/上櫃（6/5 開頭多為上櫃，但會自動嘗試）
   const type = (code.startsWith('6') || code.startsWith('5')) ? 'TWO' : 'TW';
 
-  WATCH_LIST.push({ code, name: name || code, type });
+  WATCH_LIST.push({ code, name: name || code, type, group: '未分類' });
   saveWatchList();
   renderWatchlist();
   hideAddStockModal();
@@ -206,6 +445,7 @@ function updateWatchlistPrice(code, data) {
     <div class="stock-price-val">${data.price.toFixed(2)}</div>
     <div class="stock-price-chg">${isUp ? '+' : ''}${data.changePct.toFixed(2)}%</div>
   `;
+  checkPriceAlert(code, data.price);
 }
 
 // ─── 資料抓取 (Yahoo Finance + CORS proxy) ──────────────────
@@ -1048,6 +1288,36 @@ function chipValueClass(value) {
   return n > 0 ? 'up' : n < 0 ? 'dn' : '';
 }
 
+function judgePassiveFlowRisk(chip, history, fundamental, news, score) {
+  if (!chip || !chip.enabled) return { level: '資料不足', detail: '尚未取得法人籌碼，無法推估 ETF/指數調整風險', score: 0 };
+  const inst = chip.institutional || {};
+  const foreignLots = toNumber(inst.foreign?.d5) / 1000;
+  const trustLots = toNumber(inst.trust?.d5) / 1000;
+  const volumeRatio = score?.volumePrice?.volumeRatio || 1;
+  const newsCount = (news?.items || []).length;
+  const epsUp = fundamental?.eps?.yoyHint != null && fundamental.eps.yoyHint > 0;
+  const trustBurst = trustLots >= 500 || trustLots >= Math.max(100, Math.abs(foreignLots) * 1.5);
+  const foreignBurst = foreignLots >= 800;
+  const noFundamentalSupport = !epsUp && newsCount <= 1;
+
+  let points = 0;
+  if (trustBurst) points += 35;
+  if (foreignBurst) points += 20;
+  if (volumeRatio >= 1.6) points += 20;
+  if (noFundamentalSupport) points += 15;
+  if (newsCount >= 3 || epsUp) points -= 15;
+
+  const level = points >= 55 ? '高'
+    : points >= 30 ? '中'
+    : '低';
+  const detail = level === '高'
+    ? '投信/外資買超與量能放大，但基本面或新聞支撐不足，需防 ETF/指數調整被誤判為主動買盤。'
+    : level === '中'
+      ? '法人買盤有被動資金可能，需觀察是否連續買超與持股變化。'
+      : '目前較不像單純 ETF/指數調整，仍需搭配新聞與持股變化確認。';
+  return { level, detail, score: clamp(points, 0, 100) };
+}
+
 function calcMarginShortInsight(chip, history) {
   const margin = chip?.margin;
   if (!margin) {
@@ -1087,6 +1357,222 @@ function calcMarginShortInsight(chip, history) {
   }
 
   return { label, detail, riskScore, marginBalance, shortBalance };
+}
+
+function buildAdvancedDecisionView(history, chip, news, score, labels) {
+  const latest = history[history.length - 1] || {};
+  const prev = history[history.length - 2] || latest;
+  const openPremium = prev.close ? (latest.open - prev.close) / prev.close * 100 : 0;
+  const vwap20 = calcPeriodVwap(history.slice(-20));
+  const vwap10 = calcPeriodVwap(history.slice(-10));
+  const vwap60 = calcPeriodVwap(history.slice(-60));
+  const mainLight = judgeMainLight(history, chip, score, labels);
+  const resonance = calcTrendResonance(history, score);
+  const chipStructure = calcChipStructure20(chip, history);
+  const cost = {
+    foreign: estimateCost(vwap20, chip?.institutional?.foreign?.d20),
+    main: vwap20,
+    retail: vwap10 || vwap20,
+    swing: vwap60 || vwap20,
+    current: latest.close,
+  };
+  const sentiment = calcNewsSentiment(news);
+  return { mainLight, resonance, chipStructure, cost, openPremium, sentiment };
+}
+
+function calcPeriodVwap(rows) {
+  const totalVol = rows.reduce((sum, row) => sum + (row.volume || 0), 0);
+  if (!totalVol) return rows.length ? rows[rows.length - 1].close : 0;
+  const total = rows.reduce((sum, row) => sum + row.close * (row.volume || 0), 0);
+  return round2(total / totalVol);
+}
+
+function estimateCost(base, flow) {
+  const lots = toNumber(flow) / 1000;
+  if (!base) return 0;
+  if (lots > 0) return round2(base * 0.995);
+  if (lots < 0) return round2(base * 1.005);
+  return round2(base);
+}
+
+function judgeMainLight(history, chip, score, labels) {
+  const latest = history[history.length - 1] || {};
+  const prev = history[history.length - 2] || latest;
+  const priceUp = latest.close >= prev.close;
+  const brokerScore = score?.broker?.score || 50;
+  const instScore = score?.institution?.score || 50;
+  const volumeRatio = score?.volumePrice?.volumeRatio || 1;
+  const trust = toNumber(chip?.institutional?.trust?.d5);
+  const foreign = toNumber(chip?.institutional?.foreign?.d5);
+  let state = '觀察';
+  let color = 'var(--gold)';
+  const reasons = [];
+  if (priceUp && brokerScore >= 60 && instScore >= 58) {
+    state = '偏多攻擊';
+    color = 'var(--up)';
+    reasons.push('主力與法人同步偏買');
+  } else if (priceUp && brokerScore < 45 && volumeRatio >= 1.4) {
+    state = '出貨警戒';
+    color = 'var(--dn)';
+    reasons.push('價漲量增但分點偏賣');
+  } else if (!priceUp && (trust > 0 || foreign > 0) && brokerScore >= 50) {
+    state = '洗盤觀察';
+    color = 'var(--gold)';
+    reasons.push('回檔但法人或主力仍有承接');
+  } else {
+    reasons.push(labels?.scenario || '訊號尚未同步');
+  }
+  if (trust > 0) reasons.push('投信偏買');
+  if (foreign > 0) reasons.push('外資偏買');
+  return { state, color, reasons: reasons.slice(0, 3) };
+}
+
+function calcTrendResonance(history, score) {
+  const day = score?.technical?.score || 50;
+  const weekRows = aggregateWeekly(history);
+  const weekCloses = weekRows.map(row => row.close);
+  const weekMa4 = simpleAverage(weekCloses.slice(-4));
+  const weekMa8 = simpleAverage(weekCloses.slice(-8));
+  const weekScore = weekMa4 && weekMa8 ? (weekMa4 > weekMa8 ? 70 : 35) : 50;
+  const total = Math.round((day + weekScore) / 2);
+  const label = total >= 65 ? '多週期偏多'
+    : total <= 40 ? '多週期偏空'
+    : '中性盤整';
+  return {
+    intraday: { label: 'N/A', score: 0, note: '目前未接 60分K' },
+    daily: { label: day >= 60 ? '偏多' : day <= 40 ? '偏空' : '震盪', score: day },
+    weekly: { label: weekScore >= 60 ? '偏多' : weekScore <= 40 ? '偏空' : '震盪', score: weekScore },
+    total,
+    label,
+  };
+}
+
+function aggregateWeekly(history) {
+  const buckets = new Map();
+  for (const row of history) {
+    const d = new Date(row.date);
+    const key = d.getFullYear() + '-' + getWeekNumber(d);
+    const old = buckets.get(key);
+    if (!old) buckets.set(key, { open: row.open, high: row.high, low: row.low, close: row.close, volume: row.volume });
+    else {
+      old.high = Math.max(old.high, row.high);
+      old.low = Math.min(old.low, row.low);
+      old.close = row.close;
+      old.volume += row.volume || 0;
+    }
+  }
+  return [...buckets.values()];
+}
+
+function getWeekNumber(date) {
+  const first = new Date(date.getFullYear(), 0, 1);
+  return Math.ceil((((date - first) / 86400000) + first.getDay() + 1) / 7);
+}
+
+function simpleAverage(values) {
+  const nums = values.filter(Number.isFinite);
+  if (!nums.length) return null;
+  return nums.reduce((a, b) => a + b, 0) / nums.length;
+}
+
+function calcChipStructure20(chip, history) {
+  const inst = chip?.institutional || {};
+  const foreign = Math.abs(toNumber(inst.foreign?.d20) / 1000);
+  const trust = Math.abs(toNumber(inst.trust?.d20) / 1000);
+  const dealer = Math.abs(toNumber(inst.dealer?.d20) / 1000);
+  const totalVolLots = history.slice(-20).reduce((sum, row) => sum + (row.volume || 0), 0) / 1000;
+  const known = foreign + trust + dealer;
+  const retail = Math.max(0, totalVolLots - known);
+  const total = Math.max(known + retail, 1);
+  return {
+    total: Math.round(known),
+    foreignPct: Math.round(foreign / total * 100),
+    trustPct: Math.round(trust / total * 100),
+    dealerPct: Math.round(dealer / total * 100),
+    retailPct: Math.round(retail / total * 100),
+  };
+}
+
+function calcNewsSentiment(news) {
+  const items = news?.items || [];
+  if (!items.length) return { label: '新聞不足', score: 50, detail: '目前沒有足夠新聞可分析' };
+  const positive = ['成長', '創高', '看好', '上修', '接單', '擴產', '旺', '利多', '買超'];
+  const negative = ['下修', '衰退', '虧損', '利空', '調節', '裁員', '警示', '賣超', '跌'];
+  let score = 50;
+  for (const item of items) {
+    const title = item.title || '';
+    if (positive.some(word => title.includes(word))) score += 8;
+    if (negative.some(word => title.includes(word))) score -= 8;
+  }
+  score = clamp(score, 0, 100);
+  return {
+    label: score >= 60 ? '偏正向' : score <= 40 ? '偏負向' : '中性',
+    score,
+    detail: `分析 ${items.length} 則新聞標題`,
+  };
+}
+
+function renderAdvancedDecisionPanels(view) {
+  if (!view) return '';
+  const bar = value => `<div style="height:8px;background:var(--bg-3);border-radius:4px;overflow:hidden;"><div style="height:100%;width:${clamp(value,0,100)}%;background:var(--blue);"></div></div>`;
+  return `
+    <div class="grid-3">
+      <div class="panel">
+        <div class="panel-title">🚦 主力動向警示燈</div>
+        <div style="display:flex;align-items:center;gap:18px;">
+          <div style="width:88px;height:88px;border-radius:50%;background:${view.mainLight.color};box-shadow:0 0 24px ${view.mainLight.color};opacity:.88;"></div>
+          <div>
+            <div style="font-size:24px;font-weight:700;color:${view.mainLight.color};">${view.mainLight.state}</div>
+            <div style="font-size:12px;color:var(--text-2);line-height:1.8;margin-top:6px;">${view.mainLight.reasons.map(r => '• ' + r).join('<br>')}</div>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">🎯 AI 漲跌機率</div>
+        <div style="font-size:42px;font-weight:700;color:var(--up);">${view.resonance.total}%</div>
+        <div style="font-size:12px;color:var(--text-2);">多週期趨勢共振估計</div>
+        <div style="margin-top:12px;">${bar(view.resonance.total)}</div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">⚡ 多週期趨勢共振</div>
+        <div class="indicator-row"><span class="label">60分K</span><span class="value">${view.resonance.intraday.label}</span></div>
+        <div class="indicator-row"><span class="label">日K</span><span class="value">${view.resonance.daily.label}</span></div>
+        <div class="indicator-row"><span class="label">週K</span><span class="value">${view.resonance.weekly.label}</span></div>
+        <div style="margin-top:10px;font-weight:700;color:var(--gold);">${view.resonance.label}</div>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="panel">
+        <div class="panel-title">🧅 籌碼結構（近20日）</div>
+        <div class="strategy-grid">
+          <div class="strategy-box"><div class="label">外資</div><div class="value">${view.chipStructure.foreignPct}%</div></div>
+          <div class="strategy-box"><div class="label">投信</div><div class="value">${view.chipStructure.trustPct}%</div></div>
+          <div class="strategy-box"><div class="label">自營商</div><div class="value">${view.chipStructure.dealerPct}%</div></div>
+          <div class="strategy-box"><div class="label">散戶估</div><div class="value">${view.chipStructure.retailPct}%</div></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">💰 主力成本估算</div>
+        <div class="indicator-row"><span class="label">外資成本</span><span class="value">${view.cost.foreign.toFixed(2)}</span></div>
+        <div class="indicator-row"><span class="label">主力成本</span><span class="value">${view.cost.main.toFixed(2)}</span></div>
+        <div class="indicator-row"><span class="label">散戶成本</span><span class="value">${view.cost.retail.toFixed(2)}</span></div>
+        <div class="indicator-row"><span class="label">現價</span><span class="value">${view.cost.current.toFixed(2)}</span></div>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="panel">
+        <div class="panel-title">📈 開盤溢價率</div>
+        <div style="font-size:34px;font-weight:700;color:${view.openPremium >= 0 ? 'var(--up)' : 'var(--dn)'};">${view.openPremium >= 0 ? '+' : ''}${view.openPremium.toFixed(2)}%</div>
+        <div style="font-size:12px;color:var(--text-2);margin-top:4px;">今開相對昨收，偏高代表買盤積極，但也需防開高走低。</div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">📰 即時新聞 + AI 情緒分析</div>
+        <div style="font-size:24px;font-weight:700;color:${view.sentiment.score >= 60 ? 'var(--up)' : view.sentiment.score <= 40 ? 'var(--dn)' : 'var(--gold)'};">${view.sentiment.label}</div>
+        <div style="font-size:12px;color:var(--text-2);margin-top:4px;">${view.sentiment.detail}</div>
+        <div style="margin-top:12px;">${bar(view.sentiment.score)}</div>
+      </div>
+    </div>
+  `;
 }
 
 function buildTacticalView(history, ind, score, labels) {
@@ -1217,7 +1703,7 @@ function renderTacticalPanels(tactical) {
   `;
 }
 
-function renderAIScorePanel(score, labels) {
+function renderAIScorePanel(score, labels, passiveFlow = { level: '資料不足', detail: '尚未估算' }) {
   if (!score) return '';
   const item = (title, value, note) => `
     <div class="strategy-box">
@@ -1238,6 +1724,7 @@ function renderAIScorePanel(score, labels) {
       ${item('下跌承接', labels.support, score.governmentBank.label)}
       ${item('量價技術', labels.volume, score.technical.label)}
       ${item('融資融券', score.marginShort.label, score.marginShort.detail)}
+      ${item('被動資金風險', passiveFlow.level, passiveFlow.detail)}
       ${item('風險提示', labels.risk, '籌碼資料可能受套利、ETF、分倉、隔日沖影響')}
     </div>
   `;
@@ -1316,6 +1803,105 @@ function buildChipPrompt(chip) {
 - 分點集中度：${brokers.concentration || 0}%；買超最大：${topBuy ? topBuy.name + ' ' + formatLots(topBuy.net) : '無'}；賣超最大：${topSell ? topSell.name + ' ' + formatLots(topSell.net) : '無'}`.trim();
 }
 
+async function fetchFundamentalData(code, stockName = '') {
+  if (!getFinMindToken()) return { enabled: false, eps: null, status: '未設定 FinMind Token' };
+  const d = new Date();
+  d.setFullYear(d.getFullYear() - 2);
+  const startDate = d.toISOString().slice(0, 10);
+  try {
+    const rows = await fetchFinMindData('TaiwanStockFinancialStatements', { data_id: code, start_date: startDate });
+    const epsRows = rows
+      .filter(row => String(row.type || row.account || '').toUpperCase() === 'EPS')
+      .sort((a, b) => String(a.date || '').localeCompare(String(b.date || '')));
+    const latest = epsRows[epsRows.length - 1];
+    const prev = epsRows[epsRows.length - 2];
+    return {
+      enabled: true,
+      status: latest ? 'EPS 已載入' : '查無 EPS',
+      eps: latest ? {
+        date: latest.date,
+        value: toNumber(latest.value),
+        previous: prev ? toNumber(prev.value) : null,
+        yoyHint: prev ? toNumber(latest.value) - toNumber(prev.value) : null,
+        originName: latest.origin_name || latest.account_name || '基本每股盈餘',
+      } : null,
+    };
+  } catch (err) {
+    return { enabled: true, eps: null, status: err.message };
+  }
+}
+
+async function fetchStockNews(code, stockName = '') {
+  const proxyUrl = getFinMindProxyUrl();
+  if (!proxyUrl) return { enabled: false, status: '未設定 Proxy URL', items: [] };
+  try {
+    const url = new URL(proxyUrl);
+    url.searchParams.set('endpoint', 'news');
+    url.searchParams.set('q', [code, stockName, '股票'].filter(Boolean).join(' '));
+    const res = await fetch(url.toString());
+    if (!res.ok) throw new Error('news HTTP ' + res.status);
+    const json = await res.json();
+    return {
+      enabled: true,
+      status: json.status === 200 ? '新聞已載入' : (json.msg || '新聞無資料'),
+      items: Array.isArray(json.data) ? json.data.slice(0, 5) : [],
+    };
+  } catch (err) {
+    return { enabled: true, status: err.message, items: [] };
+  }
+}
+
+function renderFundamentalNewsPanel(fundamental, news) {
+  const eps = fundamental?.eps;
+  const epsTrend = eps?.previous == null ? '無前期比較'
+    : eps.value > eps.previous ? '較前期成長'
+    : eps.value < eps.previous ? '較前期衰退'
+    : '持平';
+  const newsItems = news?.items || [];
+  return `
+    <div class="grid">
+      <div class="panel">
+        <div class="panel-title">
+          <span>📘 上季 EPS</span>
+          <span class="badge">FinMind</span>
+        </div>
+        <div class="strategy-grid">
+          <div class="strategy-box"><div class="label">最新季度</div><div class="value">${eps?.date || '--'}</div></div>
+          <div class="strategy-box"><div class="label">EPS</div><div class="value">${eps ? eps.value.toFixed(2) : '--'}</div></div>
+          <div class="strategy-box"><div class="label">前期 EPS</div><div class="value">${eps?.previous != null ? eps.previous.toFixed(2) : '--'}</div></div>
+          <div class="strategy-box"><div class="label">變化</div><div class="value ${eps?.yoyHint > 0 ? 'up' : eps?.yoyHint < 0 ? 'dn' : ''}">${eps?.yoyHint != null ? (eps.yoyHint > 0 ? '+' : '') + eps.yoyHint.toFixed(2) : '--'}</div></div>
+        </div>
+        <div style="font-size:12px;color:var(--text-2);margin-top:10px;">
+          ${fundamental?.status || ''}；${epsTrend}。EPS 屬基本面，不代表短線股價一定同步反映。
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">
+          <span>📰 相關新聞</span>
+          <span class="badge">Google News</span>
+        </div>
+        <div style="display:grid;gap:8px;">
+          ${newsItems.length ? newsItems.map(item => `
+            <a href="${item.link}" target="_blank" rel="noopener" style="display:block;color:var(--text-0);text-decoration:none;border-bottom:1px solid var(--border);padding-bottom:8px;">
+              <div style="font-size:13px;font-weight:600;line-height:1.5;">${escapeHtml(item.title)}</div>
+              <div style="font-size:11px;color:var(--text-2);margin-top:3px;">${escapeHtml(item.source || '')} · ${escapeHtml(item.pubDate || '')}</div>
+            </a>
+          `).join('') : `<div style="font-size:12px;color:var(--text-2);">${news?.status || '無新聞資料'}</div>`}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+}
+
 async function loadStock(stock) {
   currentStock = stock;
   document.querySelectorAll('.stock-item').forEach(el => el.classList.remove('active'));
@@ -1346,14 +1932,18 @@ async function loadStock(stock) {
       return;
     }
     if (!stock.name) stock.name = stock.code;
-    const chip = await fetchChipData(stock.code, history);
-    renderDashboard(stock, history, chip);
+    const [chip, fundamental, news] = await Promise.all([
+      fetchChipData(stock.code, history),
+      fetchFundamentalData(stock.code, stock.name),
+      fetchStockNews(stock.code, stock.name),
+    ]);
+    renderDashboard(stock, history, chip, fundamental, news);
   } catch(e) {
     main.innerHTML = `<div class="error-banner">⚠ 載入失敗：${e.message}</div>`;
   }
 }
 
-function renderDashboard(stock, history, chip = null) {
+function renderDashboard(stock, history, chip = null, fundamental = null, news = null) {
   const closes = history.map(h => h.close);
   const highs  = history.map(h => h.high);
   const lows   = history.map(h => h.low);
@@ -1391,6 +1981,8 @@ function renderDashboard(stock, history, chip = null) {
   const signals = generateSignals(latest, indicators);
   const aiProb = calcAIProbability(history, indicators, chip);
   const aiLabels = getAIScoreLabels(aiProb.breakdown, history, indicators, chip);
+  const passiveFlow = judgePassiveFlowRisk(chip, history, fundamental, news, aiProb.breakdown);
+  const advancedDecision = buildAdvancedDecisionView(history, chip, news, aiProb.breakdown, aiLabels);
   const tactical = buildTacticalView(history, indicators, aiProb.breakdown, aiLabels);
 
   const amp = round2((latest.high - latest.low) / prev.close * 100);
@@ -1398,6 +1990,23 @@ function renderDashboard(stock, history, chip = null) {
   const dnLimit = round2(prev.close * 0.90);
 
   const hasGemini = !!localStorage.getItem('geminiApiKey');
+  const hasClaude = !!localStorage.getItem('claudeApiKey');
+  const hasAI = hasGemini || hasClaude;
+  const aiEngine = localStorage.getItem('aiEngine') || 'auto';
+  let aiBadgeText = '未設定 API';
+  if (hasAI) {
+    if (aiEngine === 'gemini' && hasGemini) aiBadgeText = '⚡ Gemini';
+    else if (aiEngine === 'claude' && hasClaude) aiBadgeText = '🎯 Claude Haiku';
+    else if (aiEngine === 'auto') {
+      if (hasGemini && hasClaude) aiBadgeText = '🔄 Auto (Gemini→Claude)';
+      else if (hasGemini) aiBadgeText = '⚡ Gemini';
+      else if (hasClaude) aiBadgeText = '🎯 Claude Haiku';
+    } else {
+      // 引擎選了但對應 Key 不存在 → 用另一個
+      if (hasGemini) aiBadgeText = '⚡ Gemini';
+      else if (hasClaude) aiBadgeText = '🎯 Claude Haiku';
+    }
+  }
   const inWatchlist = WATCH_LIST.some(s => s.code === stock.code);
 
   const main = document.getElementById('mainContent');
@@ -1516,10 +2125,18 @@ function renderDashboard(stock, history, chip = null) {
     <div class="panel">
       <div class="panel-title">
         <span>🧠 AI 深度分析</span>
-        <span class="badge" id="aiBadge">${hasGemini ? 'Gemini AI' : '未設定 API'}</span>
+        <span class="badge" id="aiBadge">${aiBadgeText}</span>
       </div>
-      <div id="aiAnalysis" class="ai-text loading">${hasGemini ? '🤖 AI 正在分析中...' : '💡 設定 Gemini API Key 即可啟用 AI 趨勢分析（免費）'}</div>
+      <div id="aiAnalysis" class="ai-text">
+        ${hasAI
+          ? `<button id="generateAiBtn" class="add-to-watchlist" style="margin:0 0 10px 0;">生成分析</button><div style="color:var(--text-2);font-size:12px;">按下後才會呼叫 AI。${aiEngine === 'auto' && hasGemini && hasClaude ? '自動模式：先試 Gemini，失敗用 Claude。' : ''}</div>`
+          : '💡 設定 Gemini 或 Claude API Key 即可啟用 AI 趨勢分析'}
+      </div>
     </div>
+
+    ${renderAdvancedDecisionPanels(advancedDecision)}
+
+    ${renderFundamentalNewsPanel(fundamental, news)}
 
     ${renderTacticalPanels(tactical)}
 
@@ -1537,7 +2154,7 @@ function renderDashboard(stock, history, chip = null) {
           <span>🏦 法人籌碼 / 分點</span>
           <span class="badge">${chip?.enabled ? 'FinMind' : '未設定 Token'}</span>
         </div>
-        ${renderAIScorePanel(aiProb.breakdown, aiLabels)}
+        ${renderAIScorePanel(aiProb.breakdown, aiLabels, passiveFlow)}
         ${renderChipDataPanel(chip)}
       </div>
     </div>
@@ -1549,9 +2166,7 @@ function renderDashboard(stock, history, chip = null) {
     bindChartToolbar(stock);
   }, 50);
 
-  if (hasGemini) {
-    runAIAnalysis(stock, latest, indicators, pattern, signals, history, chip);
-  }
+  pendingAIAnalysis = { stock, latest, indicators, pattern, signals, history, chip };
 }
 
 function addCurrentToWatchlist() {
@@ -1564,6 +2179,7 @@ function addCurrentToWatchlist() {
     code: currentStock.code,
     name: currentStock.name || currentStock.code,
     type: currentStock.type || 'TW',
+    group: '未分類',
   });
   saveWatchList();
   renderWatchlist();
@@ -1757,61 +2373,182 @@ function bindChartToolbar(stock) {
   });
 }
 
+function generateCurrentAIAnalysis() {
+  if (!pendingAIAnalysis) return;
+  const btn = document.getElementById('generateAiBtn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '分析中...';
+  }
+  runAIAnalysis(
+    pendingAIAnalysis.stock,
+    pendingAIAnalysis.latest,
+    pendingAIAnalysis.indicators,
+    pendingAIAnalysis.pattern,
+    pendingAIAnalysis.signals,
+    pendingAIAnalysis.history,
+    pendingAIAnalysis.chip
+  );
+}
+
+function friendlyAIError(message) {
+  const msg = String(message || '');
+  if (msg.includes('timeout') || msg.includes('AbortError')) {
+    return 'AI 分析逾時，可能是 Gemini 忙碌或網路不穩。請稍後再按「重新生成」。';
+  }
+  if (msg.includes('quota') || msg.includes('rate') || msg.includes('429')) {
+    return 'Gemini 免費額度或頻率已達上限，請稍後再按「重新生成」。本頁的多空評分、籌碼評分與風險提示仍可正常使用。';
+  }
+  if (msg.includes('API key')) return 'Gemini API Key 可能無效，請到設定重新確認。';
+  return `AI 分析暫時無法產生：${msg}`;
+}
+
+function renderAiRetry(el, label = '重新生成') {
+  const retryBtn = document.createElement('button');
+  retryBtn.id = 'generateAiBtn';
+  retryBtn.className = 'add-to-watchlist';
+  retryBtn.style.marginTop = '10px';
+  retryBtn.textContent = label;
+  el.appendChild(document.createElement('br'));
+  el.appendChild(retryBtn);
+}
+
 async function runAIAnalysis(stock, latest, ind, pattern, signals, history, chip = null) {
-  const apiKey = localStorage.getItem('geminiApiKey');
-  if (!apiKey) return;
+  const geminiKey = localStorage.getItem('geminiApiKey');
+  const claudeKey = localStorage.getItem('claudeApiKey');
+  const engine = localStorage.getItem('aiEngine') || 'auto';
+
+  if (!geminiKey && !claudeKey) return;
   const el = document.getElementById('aiAnalysis');
   if (!el) return;
+  el.classList.add('loading');
+  el.style.color = '';
+  el.textContent = '🤖 AI 正在分析中...';
 
   const recent10 = history.slice(-10).map(h => `${h.date} ${h.close.toFixed(2)}`).join(', ');
+  const prompt = `你是專業台股分析師。請針對「${stock.code} ${stock.name}」做繁體中文分析，約 180 字內。
 
-  const prompt = `你是專業台股技術分析師。請針對「${stock.code} ${stock.name}」做簡潔的技術面分析（中文繁體，約 150 字內）。
-
-最新資料：
-- 收盤 ${latest.close}，當日 ${latest.high}/${latest.low}
+技術面：
+- 收盤 ${latest.close}，當日高低 ${latest.high}/${latest.low}
 - MA5/MA20/MA60: ${fmt(ind.ma5)}/${fmt(ind.ma20)}/${fmt(ind.ma60)}
 - KD: ${fmt(ind.kd_k, 1)}/${fmt(ind.kd_d, 1)}
 - RSI14: ${fmt(ind.rsi14, 1)}
 - MACD OSC: ${fmt(ind.macd_osc, 3)}
-- 趨勢型態: ${pattern.name}
+- 型態: ${pattern.name}
 - 近10日收盤: ${recent10}
 
 籌碼面：
 ${buildChipPrompt(chip)}
 
-請以四段呈現（用兩個換行分隔，不用標題符號）：
+請用四段呈現，不要前言：
 1. 趨勢判斷
-2. 關鍵技術訊號
+2. 籌碼與資金歸因
 3. 風險提醒
-4. 操作建議
+4. 操作建議`;
 
-直接輸出分析內容，不要前言。`;
+  // 決定引擎順序
+  let providers = [];
+  if (engine === 'gemini' && geminiKey) providers = ['gemini'];
+  else if (engine === 'claude' && claudeKey) providers = ['claude'];
+  else if (engine === 'auto') {
+    if (geminiKey) providers.push('gemini');
+    if (claudeKey) providers.push('claude');
+  } else {
+    // 選了某引擎但對應 Key 不存在 → 嘗試另一個
+    if (geminiKey) providers.push('gemini');
+    if (claudeKey) providers.push('claude');
+  }
+
+  if (providers.length === 0) {
+    el.classList.remove('loading');
+    el.textContent = '⚠ 未設定對應引擎的 API Key，請至設定調整。';
+    return;
+  }
+
+  let lastError = null;
+  for (let i = 0; i < providers.length; i++) {
+    const provider = providers[i];
+    try {
+      const text = await callAIProvider(provider, prompt, provider === 'gemini' ? geminiKey : claudeKey);
+      el.classList.remove('loading');
+      el.style.color = '';
+      const badge = provider === 'gemini' ? '⚡ Gemini' : '🎯 Claude Haiku';
+      el.textContent = text;
+      // 在 badge 區塊顯示引擎名稱
+      const aiBadge = document.getElementById('aiBadge');
+      if (aiBadge) aiBadge.textContent = badge;
+      return;
+    } catch(e) {
+      lastError = e;
+      // 如果是 auto 模式且還有下一個引擎，嘗試 fallback
+      if (i < providers.length - 1) {
+        el.textContent = `⚡ ${providers[i]} 失敗，切換到 ${providers[i+1]}...`;
+        continue;
+      }
+    }
+  }
+
+  // 全部都失敗
+  el.classList.remove('loading');
+  el.style.color = 'var(--up)';
+  el.textContent = friendlyAIError(lastError?.name === 'AbortError' ? 'timeout' : (lastError?.message || '未知錯誤'));
+  renderAiRetry(el);
+}
+
+async function callAIProvider(provider, prompt, apiKey) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('timeout')), 30000);
 
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.7, maxOutputTokens: 600 }
-      })
-    });
-    const data = await res.json();
-    if (data.error) throw new Error(data.error.message);
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '無回應';
-    el.classList.remove('loading');
-    el.textContent = text;
-  } catch(e) {
-    el.classList.remove('loading');
-    el.style.color = 'var(--up)';
-    el.textContent = `❌ AI 分析失敗：${e.message}`;
+    if (provider === 'gemini') {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.55, maxOutputTokens: 520 }
+        })
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error.message);
+      return data.candidates?.[0]?.content?.parts?.[0]?.text || 'AI 沒有回傳分析內容，請稍後重試。';
+    } else if (provider === 'claude') {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 600,
+          temperature: 0.55,
+          messages: [{ role: 'user', content: prompt }]
+        })
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error.message);
+      return data.content?.map(b => b.text || '').join('') || 'AI 沒有回傳分析內容，請稍後重試。';
+    }
+    throw new Error(`未知引擎: ${provider}`);
+  } finally {
+    clearTimeout(timer);
   }
 }
+
 
 function showApiKeyModal() {
   document.getElementById('apiKeyModal').classList.add('show');
   document.getElementById('apiKeyInput').value = localStorage.getItem('geminiApiKey') || '';
+  const claudeInput = document.getElementById('claudeKeyInput');
+  if (claudeInput) claudeInput.value = localStorage.getItem('claudeApiKey') || '';
+  const engineSelect = document.getElementById('aiEngineSelect');
+  if (engineSelect) engineSelect.value = localStorage.getItem('aiEngine') || 'auto';
   const finmindInput = document.getElementById('finmindTokenInput');
   if (finmindInput) finmindInput.value = localStorage.getItem('finmindToken') || '';
   const proxyInput = document.getElementById('finmindProxyInput');
@@ -1823,6 +2560,8 @@ function hideApiKeyModal() {
 }
 function saveApiKey() {
   const key = document.getElementById('apiKeyInput').value.trim();
+  const claudeKey = document.getElementById('claudeKeyInput')?.value.trim() || '';
+  const engine = document.getElementById('aiEngineSelect')?.value || 'auto';
   const finmindKey = document.getElementById('finmindTokenInput')?.value.trim() || '';
   const finmindProxy = document.getElementById('finmindProxyInput')?.value.trim() || '';
   if (key) {
@@ -1831,6 +2570,13 @@ function saveApiKey() {
   } else {
     localStorage.removeItem('geminiApiKey');
   }
+  if (claudeKey) {
+    localStorage.setItem('claudeApiKey', claudeKey);
+    localStorage.removeItem('apiKeyDismissed');
+  } else {
+    localStorage.removeItem('claudeApiKey');
+  }
+  localStorage.setItem('aiEngine', engine);
   if (finmindKey) {
     localStorage.setItem('finmindToken', finmindKey);
   } else {
