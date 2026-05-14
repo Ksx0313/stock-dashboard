@@ -382,7 +382,7 @@ body {
   <aside class="sidebar">
     <div class="brand">
       <h1>📊 台股技術分析</h1>
-      <p>Yahoo Finance + Gemini AI</p>
+      <p>Yahoo Finance + Gemini / Claude AI</p>
     </div>
 
     <div class="search-box">
@@ -420,29 +420,22 @@ body {
 
 <!-- API Key Modal -->
 <div id="apiKeyModal" class="modal-overlay">
-  <div class="modal" style="max-width:520px;">
-    <h3>🔑 設定 API Key</h3>
-    <p>所有 Key 只存在你的瀏覽器，不會傳到任何伺服器。</p>
-
-    <label>🤖 AI 引擎（預設）</label>
-    <select id="aiEngineSelect" style="width:100%;background:var(--bg-2);border:1px solid var(--border-light);color:var(--text-0);padding:10px 12px;border-radius:5px;font-size:12px;outline:none;margin-bottom:14px;">
-      <option value="auto">🔄 自動（先試 Gemini，失敗用 Claude）</option>
-      <option value="gemini">⚡ 只用 Gemini（免費）</option>
-      <option value="claude">🎯 只用 Claude Haiku（品質高，約 NT$0.09/次）</option>
-    </select>
-
-    <label>Gemini API Key（免費，AIza...）</label>
+  <div class="modal">
+    <h3>🔑 設定 API Key（免費）</h3>
+    <p>
+      用於 AI 趨勢分析。Key 只存在你的瀏覽器，不會傳到任何伺服器。<br>
+      <a href="https://aistudio.google.com/apikey" target="_blank" style="color:var(--blue);">點此取得免費 API Key →</a>
+    </p>
+    <label>Gemini API Key（AIza...）</label>
     <input id="apiKeyInput" type="text" placeholder="AIzaSy..." spellcheck="false" />
-    <div style="font-size:10px;color:var(--text-2);margin-top:-8px;margin-bottom:14px;">
-      <a href="https://aistudio.google.com/apikey" target="_blank" style="color:var(--blue);">取得免費 Gemini Key →</a>
-    </div>
-
-    <label>Claude API Key（付費，sk-ant-...）</label>
-    <input id="claudeKeyInput" type="text" placeholder="sk-ant-api03-..." spellcheck="false" />
-    <div style="font-size:10px;color:var(--text-2);margin-top:-8px;margin-bottom:14px;">
-      <a href="https://console.anthropic.com/settings/keys" target="_blank" style="color:var(--blue);">取得 Claude Key →</a> ・ 用 Haiku 4.5 模型
-    </div>
-
+    <label>Claude API Key（sk-ant...）</label>
+    <input id="claudeApiKeyInput" type="text" placeholder="sk-ant-..." spellcheck="false" />
+    <label>預設 AI 引擎</label>
+    <select id="aiProviderSelect">
+      <option value="gemini">Gemini</option>
+      <option value="claude">Claude Haiku 4.5</option>
+      <option value="auto">自動（Gemini 失敗改 Claude）</option>
+    </select>
     <label>FinMind Token（選填，啟用法人籌碼）</label>
     <input id="finmindTokenInput" type="text" placeholder="FinMind API Token" spellcheck="false" />
     <label>FinMind Proxy URL（選填，解決 GitHub Pages CORS）</label>
@@ -528,7 +521,7 @@ body {
 <!-- Toast -->
 <div id="toast" class="toast"></div>
 
-<script src="stock-dashboard.js?v=20260515-3"></script>
+<script src="stock-dashboard.js?v=20260515-5"></script>
 
 </body>
 </html>

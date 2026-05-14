@@ -29,6 +29,27 @@ let priceChart = null;
 let chartRange = '4mo';
 let pendingAIAnalysis = null;
 
+function getAIProvider() {
+  return localStorage.getItem('aiProvider') || 'gemini';
+}
+
+function getProviderLabel(provider) {
+  if (provider === 'claude') return 'Claude Haiku 4.5';
+  if (provider === 'auto') return '自動';
+  return 'Gemini';
+}
+
+function getAvailableProviderLabel() {
+  const provider = getAIProvider();
+  if (provider === 'auto') return '自動';
+  return getProviderLabel(provider);
+}
+
+function switchAIProvider(provider) {
+  localStorage.setItem('aiProvider', provider);
+  if (currentStock) loadStock(currentStock);
+}
+
 function getStockGroup(stock) {
   return stock.group || '未分類';
 }
@@ -1902,6 +1923,25 @@ function escapeHtml(value) {
     .replaceAll("'", '&#039;');
 }
 
+async function syncHistoryWithLatestQuote(code, type, history) {
+  if (!history || !history.length) return history;
+  try {
+    const recent = await fetchYahooHistory(code, type, '5d');
+    if (!recent || !recent.length) return history;
+    const latest = recent[recent.length - 1];
+    const index = history.findIndex(row => row.date === latest.date);
+    if (index >= 0) {
+      history[index] = latest;
+      return history;
+    }
+    const last = history[history.length - 1];
+    if (!last || latest.time > last.time || latest.date > last.date) {
+      return history.concat(latest);
+    }
+  } catch(e) {}
+  return history;
+}
+
 async function loadStock(stock) {
   currentStock = stock;
   document.querySelectorAll('.stock-item').forEach(el => el.classList.remove('active'));
@@ -1931,6 +1971,7 @@ async function loadStock(stock) {
       main.innerHTML = `<div class="error-banner">⚠ 無法取得 ${stock.code} 的資料，請確認代號是否正確</div>`;
       return;
     }
+    history = await syncHistoryWithLatestQuote(stock.code, stock.type, history);
     if (!stock.name) stock.name = stock.code;
     const [chip, fundamental, news] = await Promise.all([
       fetchChipData(stock.code, history),
@@ -2108,11 +2149,11 @@ function renderDashboard(stock, history, chip = null, fundamental = null, news =
     <div class="panel">
       <div class="panel-title">
         <span>🧠 AI 深度分析</span>
-        <span class="badge" id="aiBadge">${hasGemini ? 'Gemini AI' : '未設定 API'}</span>
+        <span class="badge" id="aiBadge">${hasGemini ? getAvailableProviderLabel() : '未設定 API'}</span>
       </div>
       <div id="aiAnalysis" class="ai-text">
         ${hasGemini
-          ? `<button id="generateAiBtn" class="add-to-watchlist" style="margin:0 0 10px 0;">生成分析</button><div style="color:var(--text-2);font-size:12px;">按下後才會呼叫 Gemini，避免用完免費額度。</div>`
+          ? `<div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap;"><button id="generateAiBtn" class="add-to-watchlist" style="margin:0;">生成分析</button><button class="add-to-watchlist" style="margin:0;" onclick="switchAIProvider('gemini')">Gemini</button><button class="add-to-watchlist" style="margin:0;" onclick="switchAIProvider('claude')">Claude</button><button class="add-to-watchlist" style="margin:0;" onclick="switchAIProvider('auto')">自動</button></div><div style="color:var(--text-2);font-size:12px;">目前引擎：${getAvailableProviderLabel()}。自動模式會先試 Gemini，額度失敗再切 Claude。</div>`
           : '💡 設定 Gemini API Key 即可啟用 AI 趨勢分析（免費）'}
       </div>
     </div>
@@ -2356,7 +2397,7 @@ function bindChartToolbar(stock) {
   });
 }
 
-function generateCurrentAIAnalysis() {
+function generateCurrentAIAnalysis(providerOverride = null) {
   if (!pendingAIAnalysis) return;
   const btn = document.getElementById('generateAiBtn');
   if (btn) {
@@ -2370,43 +2411,37 @@ function generateCurrentAIAnalysis() {
     pendingAIAnalysis.pattern,
     pendingAIAnalysis.signals,
     pendingAIAnalysis.history,
-    pendingAIAnalysis.chip
+    pendingAIAnalysis.chip,
+    providerOverride
   );
 }
 
 function friendlyAIError(message) {
   const msg = String(message || '');
   if (msg.includes('timeout') || msg.includes('AbortError')) {
-    return 'AI 分析逾時，可能是 Gemini 忙碌或網路不穩。請稍後再按「重新生成」。';
+    return 'AI 分析逾時，可能是模型忙碌或網路不穩。請稍後再按「重新生成」。';
   }
   if (msg.includes('quota') || msg.includes('rate') || msg.includes('429')) {
-    return 'Gemini 免費額度或頻率已達上限，請稍後再按「重新生成」。本頁的多空評分、籌碼評分與風險提示仍可正常使用。';
+    return 'AI 免費額度或頻率已達上限，請稍後再按「重新生成」，或切換其他引擎。';
   }
-  if (msg.includes('API key')) return 'Gemini API Key 可能無效，請到設定重新確認。';
+  if (msg.includes('API key')) return 'AI API Key 可能無效，請到設定重新確認。';
   return `AI 分析暫時無法產生：${msg}`;
 }
 
 function renderAiRetry(el, label = '重新生成') {
-  const retryBtn = document.createElement('button');
-  retryBtn.id = 'generateAiBtn';
-  retryBtn.className = 'add-to-watchlist';
-  retryBtn.style.marginTop = '10px';
-  retryBtn.textContent = label;
-  el.appendChild(document.createElement('br'));
-  el.appendChild(retryBtn);
+  const wrap = document.createElement('div');
+  wrap.style.marginTop = '10px';
+  wrap.innerHTML = `
+    <button id="generateAiBtn" class="add-to-watchlist" style="margin:0 8px 0 0;">${label}</button>
+    <button class="add-to-watchlist" style="margin:0 8px 0 0;" onclick="generateCurrentAIAnalysis('gemini')">Gemini</button>
+    <button class="add-to-watchlist" style="margin:0;" onclick="generateCurrentAIAnalysis('claude')">Claude</button>
+  `;
+  el.appendChild(wrap);
 }
 
-async function runAIAnalysis(stock, latest, ind, pattern, signals, history, chip = null) {
-  const apiKey = localStorage.getItem('geminiApiKey');
-  if (!apiKey) return;
-  const el = document.getElementById('aiAnalysis');
-  if (!el) return;
-  el.classList.add('loading');
-  el.style.color = '';
-  el.textContent = '🤖 AI 正在分析中...';
-
+function buildAIPrompt(stock, latest, ind, pattern, history, chip) {
   const recent10 = history.slice(-10).map(h => `${h.date} ${h.close.toFixed(2)}`).join(', ');
-  const prompt = `你是專業台股分析師。請針對「${stock.code} ${stock.name}」做繁體中文分析，約 180 字內。
+  return `你是專業台股分析師。請針對「${stock.code} ${stock.name}」做繁體中文分析，約 180 字內。
 
 技術面：
 - 收盤 ${latest.close}，當日高低 ${latest.high}/${latest.low}
@@ -2425,26 +2460,85 @@ ${buildChipPrompt(chip)}
 2. 籌碼與資金歸因
 3. 風險提醒
 4. 操作建議`;
+}
 
+async function callGemini(prompt, signal) {
+  const apiKey = localStorage.getItem('geminiApiKey');
+  if (!apiKey) throw new Error('Gemini API key missing');
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.55, maxOutputTokens: 520 }
+    })
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || 'Gemini 沒有回傳分析內容。';
+}
+
+async function callClaude(prompt, signal) {
+  const apiKey = localStorage.getItem('claudeApiKey');
+  const proxyUrl = getFinMindProxyUrl();
+  if (!apiKey) throw new Error('Claude API key missing');
+  if (!proxyUrl) throw new Error('Claude 需要 FinMind Proxy URL / Cloudflare Worker');
+  const url = new URL(proxyUrl);
+  url.searchParams.set('endpoint', 'ai');
+  const res = await fetch(url.toString(), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: JSON.stringify({
+      provider: 'claude',
+      apiKey,
+      model: 'claude-haiku-4-5-20251001',
+      prompt,
+    })
+  });
+  const data = await res.json();
+  if (!res.ok || data.error) throw new Error(data.error || data.msg || 'Claude proxy failed');
+  return data.text || 'Claude 沒有回傳分析內容。';
+}
+
+async function runAIAnalysis(stock, latest, ind, pattern, signals, history, chip = null, providerOverride = null) {
+  const el = document.getElementById('aiAnalysis');
+  if (!el) return;
+  const selected = providerOverride || getAIProvider();
+  el.classList.add('loading');
+  el.style.color = '';
+  el.textContent = `🤖 AI 正在分析中（${getProviderLabel(selected)}）...`;
+
+  const prompt = buildAIPrompt(stock, latest, ind, pattern, history, chip);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error('timeout')), 30000);
+  let used = selected;
 
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.55, maxOutputTokens: 520 }
-      })
-    });
-    const data = await res.json();
-    if (data.error) throw new Error(data.error.message);
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || 'AI 沒有回傳分析內容，請稍後重試。';
+    let text;
+    if (selected === 'claude') {
+      text = await callClaude(prompt, controller.signal);
+    } else if (selected === 'auto') {
+      try {
+        used = 'gemini';
+        text = await callGemini(prompt, controller.signal);
+      } catch (firstError) {
+        const msg = String(firstError.message || '');
+        if (!(msg.includes('quota') || msg.includes('rate') || msg.includes('429'))) throw firstError;
+        used = 'claude';
+        text = await callClaude(prompt, controller.signal);
+      }
+    } else {
+      used = 'gemini';
+      text = await callGemini(prompt, controller.signal);
+    }
     el.classList.remove('loading');
-    el.textContent = text;
+    el.style.color = '';
+    el.innerHTML = `<div style="font-size:10px;color:var(--text-2);margin-bottom:8px;">使用引擎：${getProviderLabel(used)}</div>${escapeHtml(text).replace(/\n/g, '<br>')}`;
+    const badge = document.getElementById('aiBadge');
+    if (badge) badge.textContent = getProviderLabel(used);
   } catch(e) {
     el.classList.remove('loading');
     el.style.color = 'var(--up)';
@@ -2461,6 +2555,10 @@ function showApiKeyModal() {
   document.getElementById('apiKeyInput').value = localStorage.getItem('geminiApiKey') || '';
   const finmindInput = document.getElementById('finmindTokenInput');
   if (finmindInput) finmindInput.value = localStorage.getItem('finmindToken') || '';
+  const claudeInput = document.getElementById('claudeApiKeyInput');
+  if (claudeInput) claudeInput.value = localStorage.getItem('claudeApiKey') || '';
+  const providerInput = document.getElementById('aiProviderSelect');
+  if (providerInput) providerInput.value = getAIProvider();
   const proxyInput = document.getElementById('finmindProxyInput');
   if (proxyInput) proxyInput.value = localStorage.getItem('finmindProxyUrl') || '';
   setTimeout(() => document.getElementById('apiKeyInput').focus(), 100);
@@ -2471,6 +2569,8 @@ function hideApiKeyModal() {
 function saveApiKey() {
   const key = document.getElementById('apiKeyInput').value.trim();
   const finmindKey = document.getElementById('finmindTokenInput')?.value.trim() || '';
+  const claudeKey = document.getElementById('claudeApiKeyInput')?.value.trim() || '';
+  const aiProvider = document.getElementById('aiProviderSelect')?.value || 'gemini';
   const finmindProxy = document.getElementById('finmindProxyInput')?.value.trim() || '';
   if (key) {
     localStorage.setItem('geminiApiKey', key);
@@ -2483,6 +2583,12 @@ function saveApiKey() {
   } else {
     localStorage.removeItem('finmindToken');
   }
+  if (claudeKey) {
+    localStorage.setItem('claudeApiKey', claudeKey);
+  } else {
+    localStorage.removeItem('claudeApiKey');
+  }
+  localStorage.setItem('aiProvider', aiProvider);
   if (finmindProxy) {
     localStorage.setItem('finmindProxyUrl', finmindProxy);
   } else {
