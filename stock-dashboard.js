@@ -456,72 +456,178 @@ function generateSignals(latest, ind) {
 }
 
 function calcAIProbability(history, ind, chip = null) {
-  let bullScore = 50, bearScore = 50;
-  if (ind.ma5 && ind.ma20 && ind.ma60) {
-    if (ind.ma5 > ind.ma20 && ind.ma20 > ind.ma60) bullScore += 12;
-    else if (ind.ma5 < ind.ma20 && ind.ma20 < ind.ma60) bearScore += 12;
-  }
-  if (ind.kd_k != null && ind.kd_d != null) {
-    if (ind.kd_k > ind.kd_d && ind.kd_k < 80) bullScore += 8;
-    else if (ind.kd_k < ind.kd_d && ind.kd_k > 20) bearScore += 8;
-  }
-  if (ind.macd_osc != null) {
-    if (ind.macd_osc > 0) bullScore += 6;
-    else bearScore += 6;
-  }
-  if (ind.rsi14 != null) {
-    if (ind.rsi14 < 30) bullScore += 8;
-    else if (ind.rsi14 > 70) bearScore += 8;
-    else if (ind.rsi14 > 50 && ind.rsi14 < 65) bullScore += 4;
-    else if (ind.rsi14 < 50 && ind.rsi14 > 35) bearScore += 4;
-  }
-  if (history.length >= 5) {
-    const recent5 = history.slice(-5);
-    const avgChange = (recent5[4].close - recent5[0].close) / recent5[0].close;
-    if (avgChange > 0.03) bullScore += 5;
-    else if (avgChange < -0.03) bearScore += 5;
-  }
-  const chipScore = calcChipProbabilityScore(chip);
-  bullScore += chipScore.bull;
-  bearScore += chipScore.bear;
-  const total = bullScore + bearScore;
+  const score = calcAIScoreBreakdown(history, ind, chip);
   return {
-    bull: Math.round(bullScore / total * 100),
-    bear: Math.round(bearScore / total * 100),
+    bull: score.total,
+    bear: 100 - score.total,
+    breakdown: score,
   };
 }
 
-function calcChipProbabilityScore(chip) {
-  if (!chip || !chip.enabled) return { bull: 0, bear: 0 };
+function calcAIScoreBreakdown(history, ind, chip = null) {
+  const technical = calcTechnicalTrendScore(history, ind);
+  const institution = calcInstitutionScore(chip);
+  const broker = calcBrokerStructureScore(chip);
+  const foreignHolding = calcForeignHoldingScore(chip);
+  const governmentBank = calcGovernmentBankScore(chip);
+  const volumePrice = calcVolumePriceScore(history);
 
-  let bull = 0;
-  let bear = 0;
-  const addFlowScore = (value, weight) => {
-    const lots = toNumber(value) / 1000;
-    if (!Number.isFinite(lots) || lots === 0) return;
-    const score = Math.min(Math.abs(lots) / 150, 1) * weight;
-    if (lots > 0) bull += score;
-    else bear += score;
+  const total = clamp(Math.round(
+    technical.score * 0.30 +
+    institution.score * 0.25 +
+    broker.score * 0.25 +
+    foreignHolding.score * 0.10 +
+    governmentBank.score * 0.10
+  ), 0, 100);
+
+  return {
+    total,
+    technical,
+    institution,
+    broker,
+    foreignHolding,
+    governmentBank,
+    volumePrice,
+    chipOverall: clamp(Math.round(
+      institution.score * 0.35 +
+      broker.score * 0.35 +
+      foreignHolding.score * 0.15 +
+      governmentBank.score * 0.15
+    ), 0, 100),
   };
+}
 
-  const inst = chip.institutional || {};
-  addFlowScore(inst.foreign?.d1, 5);
-  addFlowScore(inst.foreign?.d5, 8);
-  addFlowScore(inst.trust?.d5, 7);
-  addFlowScore(inst.dealer?.d5, 4);
-  addFlowScore(inst.total?.d20, 8);
-  addFlowScore(chip.governmentBank?.d5, 4);
-
-  const buyNet = (chip.brokers?.buyTop || []).reduce((sum, row) => sum + Math.max(0, toNumber(row.net)), 0);
-  const sellNet = (chip.brokers?.sellTop || []).reduce((sum, row) => sum + Math.abs(Math.min(0, toNumber(row.net))), 0);
-  const brokerTotal = buyNet + sellNet;
-  if (brokerTotal > 0) {
-    const brokerWeight = chip.brokers?.concentration >= 55 ? 7 : 5;
-    bull += (buyNet / brokerTotal) * brokerWeight;
-    bear += (sellNet / brokerTotal) * brokerWeight;
+function calcTechnicalTrendScore(history, ind) {
+  let score = 50;
+  const latest = history[history.length - 1] || {};
+  if (ind.ma5 && ind.ma10 && ind.ma20) {
+    if (latest.close > ind.ma5 && ind.ma5 > ind.ma10 && ind.ma10 > ind.ma20) score += 22;
+    else if (latest.close > ind.ma5 && latest.close > ind.ma20) score += 12;
+    else if (latest.close < ind.ma5 && ind.ma5 < ind.ma10 && ind.ma10 < ind.ma20) score -= 22;
+    else if (latest.close < ind.ma20) score -= 12;
   }
+  if (ind.macd_osc != null) score += ind.macd_osc > 0 ? 8 : -8;
+  if (ind.rsi14 != null) {
+    if (ind.rsi14 >= 50 && ind.rsi14 <= 68) score += 8;
+    else if (ind.rsi14 > 75) score -= 8;
+    else if (ind.rsi14 < 35) score -= 8;
+  }
+  if (ind.kd_k != null && ind.kd_d != null) {
+    if (ind.kd_k > ind.kd_d && ind.kd_k < 85) score += 6;
+    else if (ind.kd_k < ind.kd_d && ind.kd_k > 15) score -= 6;
+  }
+  return { score: clamp(Math.round(score), 0, 100), label: score >= 65 ? '技術偏多' : score <= 40 ? '技術偏空' : '技術中性' };
+}
 
-  return { bull, bear };
+function calcInstitutionScore(chip) {
+  if (!chip || !chip.enabled) return { score: 50, label: '法人資料不足' };
+  const inst = chip.institutional || {};
+  let score = 50;
+  score += scaledLotsScore(inst.foreign?.d5, 10);
+  score += scaledLotsScore(inst.trust?.d5, 14);
+  score += scaledLotsScore(inst.dealer?.d5, 5);
+  score += scaledLotsScore(inst.total?.d20, 12);
+  const foreign = toNumber(inst.foreign?.d5);
+  const trust = toNumber(inst.trust?.d5);
+  const label = trust > 0 && foreign > 0 ? '外資投信同步偏多'
+    : trust > 0 ? '投信偏多'
+    : foreign > 0 ? '外資偏多'
+    : trust < 0 && foreign < 0 ? '法人同步偏空'
+    : '法人中性';
+  return { score: clamp(Math.round(score), 0, 100), label };
+}
+
+function calcBrokerStructureScore(chip) {
+  if (!chip || !chip.enabled) return { score: 50, label: '分點資料不足' };
+  const brokers = chip.brokers || {};
+  const buyNet = (brokers.buyTop || []).reduce((sum, row) => sum + Math.max(0, toNumber(row.net)), 0);
+  const sellNet = (brokers.sellTop || []).reduce((sum, row) => sum + Math.abs(Math.min(0, toNumber(row.net))), 0);
+  const total = buyNet + sellNet;
+  if (!total) return { score: 50, label: '分點無明顯方向' };
+  const buyRatio = buyNet / total;
+  let score = 50 + (buyRatio - 0.5) * 70;
+  const concentration = toNumber(brokers.concentration);
+  if (concentration >= 65 && buyRatio < 0.45) score -= 12;
+  if (concentration >= 65 && buyRatio > 0.58) score += 6;
+  const label = buyRatio >= 0.58 && concentration >= 45 ? '買方集中，偏吸籌'
+    : buyRatio <= 0.42 && concentration >= 45 ? '賣方集中，疑似出貨'
+    : buyRatio >= 0.55 ? '買方略強，健康換手'
+    : buyRatio <= 0.45 ? '賣方略強，換手偏弱'
+    : '買賣均衡，健康換手';
+  return { score: clamp(Math.round(score), 0, 100), label, buyRatio: Math.round(buyRatio * 100), concentration };
+}
+
+function calcForeignHoldingScore(chip) {
+  if (!chip || !chip.enabled || !chip.shareholding) return { score: 50, label: '外資持股資料不足' };
+  const inst = chip.institutional || {};
+  const foreignBuy = toNumber(inst.foreign?.d5);
+  const ratio = chip.shareholding.ratio;
+  let score = 50;
+  if (foreignBuy > 0) score += 8;
+  if (foreignBuy < 0) score -= 8;
+  if (ratio != null && ratio >= 20) score += 5;
+  const label = foreignBuy > 0 && ratio != null ? '外資買超，需觀察持股續增'
+    : foreignBuy > 0 ? '外資買超但持股待確認'
+    : foreignBuy < 0 ? '外資偏賣'
+    : '外資中性';
+  return { score: clamp(Math.round(score), 0, 100), label };
+}
+
+function calcGovernmentBankScore(chip) {
+  if (!chip || !chip.enabled) return { score: 50, label: '八大資料不足' };
+  const d5 = toNumber(chip.governmentBank?.d5);
+  const score = clamp(Math.round(50 + scaledLotsScore(d5, 18)), 0, 100);
+  const label = d5 > 0 ? '八大偏承接' : d5 < 0 ? '八大偏調節' : '八大中性';
+  return { score, label };
+}
+
+function calcVolumePriceScore(history) {
+  if (!history || history.length < 6) return { score: 50, label: '量價資料不足' };
+  const latest = history[history.length - 1];
+  const prev = history[history.length - 2];
+  const avg5Vol = history.slice(-6, -1).reduce((sum, row) => sum + row.volume, 0) / 5;
+  const priceUp = latest.close > prev.close;
+  const volumeRatio = avg5Vol ? latest.volume / avg5Vol : 1;
+  let score = 50;
+  if (priceUp && volumeRatio >= 1.2) score += 18;
+  else if (priceUp && volumeRatio < 0.8) score += 4;
+  else if (!priceUp && volumeRatio >= 1.2) score -= 18;
+  else if (!priceUp && volumeRatio < 0.8) score -= 4;
+  const label = priceUp && volumeRatio >= 1.2 ? '量增價漲'
+    : priceUp ? '價漲量縮'
+    : volumeRatio >= 1.2 ? '量增價跌'
+    : '量縮整理';
+  return { score: clamp(Math.round(score), 0, 100), label, volumeRatio };
+}
+
+function scaledLotsScore(value, maxScore) {
+  const lots = toNumber(value) / 1000;
+  if (!Number.isFinite(lots) || lots === 0) return 0;
+  return Math.sign(lots) * Math.min(Math.abs(lots) / 150, 1) * maxScore;
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function getAIScoreLabels(score, history, ind, chip) {
+  const trend = score.technical;
+  const inst = score.institution;
+  const broker = score.broker;
+  const gov = score.governmentBank;
+  const latest = history?.[history.length - 1] || {};
+  const extended = ind?.ma5 && latest.close > ind.ma5 && score.volumePrice?.volumeRatio >= 1.5 && score.total >= 70;
+  return {
+    chipScore: score.chipOverall,
+    mainForce: broker.label,
+    institution: inst.label,
+    broker: broker.label,
+    support: gov.label,
+    risk: extended ? '短線漲幅與量能偏熱，跌破5日線需防隔日沖倒貨'
+      : score.broker.score <= 40 ? '分點賣壓偏集中，需留意主力出貨'
+      : score.institution.score >= 65 && trend.score >= 60 ? '籌碼與技術同向，留意續航量'
+      : '訊號未完全同步，適合等待確認',
+  };
 }
 
 
@@ -796,6 +902,26 @@ function chipValueClass(value) {
   return n > 0 ? 'up' : n < 0 ? 'dn' : '';
 }
 
+function renderAIScorePanel(score, labels) {
+  if (!score) return '';
+  const item = (title, value, note) => `
+    <div class="strategy-box">
+      <div class="label">${title}</div>
+      <div class="value">${value}</div>
+      <div style="font-size:11px;color:var(--text-2);margin-top:4px;">${note}</div>
+    </div>`;
+  return `
+    <div class="strategy-grid" style="margin-bottom:12px;">
+      ${item('AI 多空評分', score.total + ' / 100', '技術30% 法人25% 分點25% 持股10% 八大10%')}
+      ${item('籌碼評分', labels.chipScore + ' / 100', labels.mainForce)}
+      ${item('法人態度', labels.institution, score.institution.label)}
+      ${item('主力狀態', labels.mainForce, labels.broker)}
+      ${item('下跌承接', labels.support, score.governmentBank.label)}
+      ${item('風險提示', labels.risk, score.volumePrice.label)}
+    </div>
+  `;
+}
+
 function renderChipDataPanel(chip) {
   if (!chip || !chip.enabled) {
     return `
@@ -942,6 +1068,7 @@ function renderDashboard(stock, history, chip = null) {
   const candle = detectCandle(history);
   const signals = generateSignals(latest, indicators);
   const aiProb = calcAIProbability(history, indicators, chip);
+  const aiLabels = getAIScoreLabels(aiProb.breakdown, history, indicators, chip);
 
   const amp = round2((latest.high - latest.low) / prev.close * 100);
   const upLimit = round2(prev.close * 1.10);
@@ -1085,6 +1212,7 @@ function renderDashboard(stock, history, chip = null) {
           <span>🏦 法人籌碼 / 分點</span>
           <span class="badge">${chip?.enabled ? 'FinMind' : '未設定 Token'}</span>
         </div>
+        ${renderAIScorePanel(aiProb.breakdown, aiLabels)}
         ${renderChipDataPanel(chip)}
       </div>
     </div>
