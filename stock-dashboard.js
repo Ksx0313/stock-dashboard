@@ -1483,8 +1483,33 @@ function buildAdvancedDecisionView(history, chip, news, score, labels) {
     swing: vwap60 || vwap20,
     current: latest.close,
   };
-  const sentiment = calcNewsSentiment(news);
+  const sentiment = calcNewsSentimentV2(news);
   return { mainLight, resonance, chipStructure, cost, openPremium, sentiment };
+}
+
+function calcNewsSentimentV2(news) {
+  const items = news?.items || [];
+  if (!items.length) {
+    return {
+      label: '新聞不足',
+      score: 50,
+      detail: '目前沒有足夠近期新聞，情緒分數維持中性，不納入多空加權。',
+    };
+  }
+  const positive = ['上修', '調高', '成長', '創高', '優於', '受惠', '強勁', '擴產', '接單', '法說看好', '營收增'];
+  const negative = ['下修', '調降', '衰退', '虧損', '低於', '利空', '疲弱', '庫存', '砍單', '訴訟', '營收減'];
+  let score = 50;
+  for (const item of items) {
+    const title = item.title || '';
+    if (positive.some(word => title.includes(word))) score += 8;
+    if (negative.some(word => title.includes(word))) score -= 8;
+  }
+  score = clamp(score, 0, 100);
+  return {
+    label: score >= 60 ? '偏正向' : score <= 40 ? '偏負向' : '中性',
+    score,
+    detail: `已讀取 ${items.length} 則近期新聞標題做初步情緒判斷。`,
+  };
 }
 
 function calcPeriodVwap(rows) {
@@ -2281,7 +2306,7 @@ function renderDashboard(stock, history, chip = null, fundamental = null, news =
     bindChartToolbar(stock);
   }, 50);
 
-  pendingAIAnalysis = { stock, latest, indicators, pattern, signals, history, chip };
+  pendingAIAnalysis = { stock, latest, indicators, pattern, signals, history, chip, news };
 }
 
 function addCurrentToWatchlist() {
@@ -2503,6 +2528,7 @@ function generateCurrentAIAnalysis(providerOverride = null) {
     pendingAIAnalysis.signals,
     pendingAIAnalysis.history,
     pendingAIAnalysis.chip,
+    pendingAIAnalysis.news,
     providerOverride
   );
 }
@@ -2530,7 +2556,18 @@ function renderAiRetry(el, label = '重新生成') {
   el.appendChild(wrap);
 }
 
-function buildAIPrompt(stock, latest, ind, pattern, history, chip) {
+function buildNewsPrompt(news) {
+  const items = news?.items || [];
+  if (!items.length) {
+    return '新聞資料：不足。請明確標示「新聞不足」，不要把新聞情緒納入多空加權，只能作為缺資料風險提醒。';
+  }
+  return [
+    `新聞資料：共 ${items.length} 則，請判斷市場情緒偏正向、負向或中性。`,
+    ...items.slice(0, 5).map((item, index) => `${index + 1}. ${item.title || ''}（${item.source || '未知來源'} ${item.pubDate || ''}）`)
+  ].join('\n');
+}
+
+function buildAIPrompt(stock, latest, ind, pattern, history, chip, news = null) {
   const recent10 = history.slice(-10).map(h => `${h.date} ${h.close.toFixed(2)}`).join(', ');
   return `你是專業台股分析師。請針對「${stock.code} ${stock.name}」做繁體中文分析，約 180 字內。
 
@@ -2545,6 +2582,9 @@ function buildAIPrompt(stock, latest, ind, pattern, history, chip) {
 
 籌碼面：
 ${buildChipPrompt(chip)}
+
+新聞 / 情緒面：
+${buildNewsPrompt(news)}
 
 請用四段呈現，不要前言：
 1. 趨勢判斷
@@ -2594,7 +2634,7 @@ async function callClaude(prompt, signal) {
   return data.text || 'Claude 沒有回傳分析內容。';
 }
 
-async function runAIAnalysis(stock, latest, ind, pattern, signals, history, chip = null, providerOverride = null) {
+async function runAIAnalysis(stock, latest, ind, pattern, signals, history, chip = null, news = null, providerOverride = null) {
   const el = document.getElementById('aiAnalysis');
   if (!el) return;
   const selected = providerOverride || getAIProvider();
@@ -2602,7 +2642,7 @@ async function runAIAnalysis(stock, latest, ind, pattern, signals, history, chip
   el.style.color = '';
   el.textContent = `🤖 AI 正在分析中（${getProviderLabel(selected)}）...`;
 
-  const prompt = buildAIPrompt(stock, latest, ind, pattern, history, chip);
+  const prompt = buildAIPrompt(stock, latest, ind, pattern, history, chip, news);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error('timeout')), 30000);
   let used = selected;
