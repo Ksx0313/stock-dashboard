@@ -1046,6 +1046,131 @@ function chipValueClass(value) {
   return n > 0 ? 'up' : n < 0 ? 'dn' : '';
 }
 
+function buildTacticalView(history, ind, score, labels) {
+  const latest = history[history.length - 1] || {};
+  const prev = history[history.length - 2] || latest;
+  const recent20 = history.slice(-20);
+  const recent60 = history.slice(-60);
+  const highs20 = recent20.map(row => row.high).filter(Number.isFinite);
+  const lows20 = recent20.map(row => row.low).filter(Number.isFinite);
+  const highs60 = recent60.map(row => row.high).filter(Number.isFinite);
+  const lows60 = recent60.map(row => row.low).filter(Number.isFinite);
+  const recentHigh = Math.max(...highs20, latest.high || 0);
+  const recentLow = Math.min(...lows20, latest.low || latest.close || 0);
+  const swingHigh = Math.max(...highs60, recentHigh);
+  const swingLow = Math.min(...lows60, recentLow);
+  const close = latest.close || 0;
+  const pressureLow = round2(Math.max(recentHigh * 0.99, close * 1.01));
+  const pressureHigh = round2(Math.max(recentHigh, close * 1.04));
+  const supportLow = round2(Math.min(ind.ma20 || close * 0.96, close * 0.97));
+  const supportHigh = round2(Math.max(ind.ma20 || close * 0.96, close * 0.985));
+  const strongSupportLow = round2(Math.min(ind.ma60 || swingLow, swingLow * 1.03));
+  const strongSupportHigh = round2(Math.max(ind.ma60 || swingLow, swingLow * 1.08));
+  const stopLoss = round2(Math.min(supportLow * 0.985, close * 0.94));
+  const breakoutTarget = round2(pressureHigh + Math.max(pressureHigh - supportLow, close * 0.04));
+  const pullbackTarget = round2(supportLow);
+  const weakTarget = round2(Math.max(strongSupportLow, stopLoss * 0.94));
+  const winRate = calcShortTermWinRate(score, ind, history);
+  const warnings = buildRiskWarnings(history, ind, score, labels);
+  const summary = buildFocusSummary(score, labels, ind, history);
+
+  return {
+    keyPrices: { pressureLow, pressureHigh, supportLow, supportHigh, strongSupportLow, strongSupportHigh, stopLoss },
+    paths: {
+      up: `突破 ${pressureHigh} 後，挑戰 ${breakoutTarget}`,
+      pullback: `跌破 ${supportLow}，回測 ${strongSupportLow} ~ ${strongSupportHigh}`,
+      weak: `跌破 ${stopLoss}，轉弱看 ${weakTarget}`,
+    },
+    winRate,
+    warnings,
+    summary,
+  };
+}
+
+function calcShortTermWinRate(score, ind, history) {
+  let rate = score?.total || 50;
+  const latest = history[history.length - 1] || {};
+  if (ind.rsi14 > 75) rate -= 8;
+  if (ind.kd_k > 85) rate -= 6;
+  if (score?.volumePrice?.volumeRatio >= 1.8 && latest.close > latest.open) rate -= 3;
+  if (score?.broker?.score >= 60 && score?.institution?.score >= 60) rate += 6;
+  if (score?.broker?.score <= 40 && score?.institution?.score <= 45) rate -= 8;
+  return clamp(Math.round(rate), 5, 95);
+}
+
+function buildRiskWarnings(history, ind, score, labels) {
+  const latest = history[history.length - 1] || {};
+  const prev = history[history.length - 2] || latest;
+  const warnings = [];
+  const dayChangePct = prev.close ? (latest.close - prev.close) / prev.close * 100 : 0;
+  if (dayChangePct >= 7) warnings.push('單日漲幅偏大，追高風險升高');
+  if (score?.volumePrice?.volumeRatio >= 1.8) warnings.push('爆量，需確認是攻擊量或出貨量');
+  if (ind.rsi14 >= 70 || ind.kd_k >= 85) warnings.push('RSI/KD 過熱，短線易震盪');
+  if (score?.institution?.score < 50 && score?.broker?.score < 50) warnings.push('法人與分點不同步，突破可信度下降');
+  if (labels?.tradeStructure === '拉高出貨' || labels?.tradeStructure === '倒貨') warnings.push('買賣結構偏風險，需防主力調節');
+  if (!warnings.length) warnings.push('暫無明顯高風險訊號，仍需依支撐停損控管');
+  return warnings;
+}
+
+function buildFocusSummary(score, labels, ind, history) {
+  const trend = score?.technical?.score >= 65 ? '偏強' : score?.technical?.score <= 40 ? '偏弱' : '震盪';
+  const technical = ind.rsi14 >= 70 || ind.kd_k >= 85 ? '過熱' : score?.technical?.score >= 60 ? '健康' : score?.technical?.score <= 40 ? '轉弱' : '觀察';
+  const chip = labels?.tradeStructure || labels?.mainForce || '待確認';
+  const difficulty = (technical === '過熱' || labels?.tradeStructure === '拉高出貨' || labels?.tradeStructure === '倒貨') ? '偏高'
+    : score?.total >= 65 ? '中' : '中高';
+  return { trend, technical, chip, difficulty };
+}
+
+function renderTacticalPanels(tactical) {
+  if (!tactical) return '';
+  const box = (title, value, note = '') => `
+    <div class="strategy-box">
+      <div class="label">${title}</div>
+      <div class="value">${value}</div>
+      ${note ? `<div style="font-size:11px;color:var(--text-2);margin-top:4px;line-height:1.5;">${note}</div>` : ''}
+    </div>`;
+  return `
+    <div class="grid">
+      <div class="panel">
+        <div class="panel-title">🎯 關鍵價位</div>
+        <div class="strategy-grid">
+          ${box('壓力區', `${tactical.keyPrices.pressureLow} ~ ${tactical.keyPrices.pressureHigh}`)}
+          ${box('支撐區', `${tactical.keyPrices.supportLow} ~ ${tactical.keyPrices.supportHigh}`)}
+          ${box('強支撐', `${tactical.keyPrices.strongSupportLow} ~ ${tactical.keyPrices.strongSupportHigh}`)}
+          ${box('停損價', tactical.keyPrices.stopLoss)}
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">🧭 可能路徑</div>
+        <div class="strategy-grid">
+          ${box('上漲', '突破', tactical.paths.up)}
+          ${box('回檔', '測支撐', tactical.paths.pullback)}
+          ${box('轉弱', '跌破停損', tactical.paths.weak)}
+        </div>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="panel">
+        <div class="panel-title">📈 短線進場勝率</div>
+        <div style="font-size:38px;font-weight:700;color:${tactical.winRate >= 60 ? 'var(--up)' : tactical.winRate <= 45 ? 'var(--dn)' : 'var(--gold)'};">${tactical.winRate}%</div>
+        <div style="font-size:12px;color:var(--text-2);margin-top:4px;">由技術、籌碼、分點與量價結構加權估算</div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">⚠ 風險提醒 / 重點總結</div>
+        <div style="font-size:12px;color:var(--text-1);line-height:1.8;">
+          ${tactical.warnings.map(item => `<div>• ${item}</div>`).join('')}
+        </div>
+        <div class="strategy-grid" style="margin-top:12px;">
+          ${box('趨勢', tactical.summary.trend)}
+          ${box('技術', tactical.summary.technical)}
+          ${box('籌碼', tactical.summary.chip)}
+          ${box('難度', tactical.summary.difficulty)}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function renderAIScorePanel(score, labels) {
   if (!score) return '';
   const item = (title, value, note) => `
@@ -1219,6 +1344,7 @@ function renderDashboard(stock, history, chip = null) {
   const signals = generateSignals(latest, indicators);
   const aiProb = calcAIProbability(history, indicators, chip);
   const aiLabels = getAIScoreLabels(aiProb.breakdown, history, indicators, chip);
+  const tactical = buildTacticalView(history, indicators, aiProb.breakdown, aiLabels);
 
   const amp = round2((latest.high - latest.low) / prev.close * 100);
   const upLimit = round2(prev.close * 1.10);
@@ -1347,6 +1473,8 @@ function renderDashboard(stock, history, chip = null) {
       </div>
       <div id="aiAnalysis" class="ai-text loading">${hasGemini ? '🤖 AI 正在分析中...' : '💡 設定 Gemini API Key 即可啟用 AI 趨勢分析（免費）'}</div>
     </div>
+
+    ${renderTacticalPanels(tactical)}
 
     <div class="grid">
       <div class="panel">
