@@ -615,18 +615,103 @@ function getAIScoreLabels(score, history, ind, chip) {
   const inst = score.institution;
   const broker = score.broker;
   const gov = score.governmentBank;
+  const foreign = score.foreignHolding;
+  const volume = score.volumePrice;
   const latest = history?.[history.length - 1] || {};
-  const extended = ind?.ma5 && latest.close > ind.ma5 && score.volumePrice?.volumeRatio >= 1.5 && score.total >= 70;
+  const prev = history?.[history.length - 2] || latest;
+  const foreignBuy = toNumber(chip?.institutional?.foreign?.d5);
+  const trustBuy = toNumber(chip?.institutional?.trust?.d5);
+  const govBuy = toNumber(chip?.governmentBank?.d5);
+  const priceUp = latest.close >= prev.close;
+  const strongVolume = (volume?.volumeRatio || 1) >= 1.3;
+
+  const scenario = judgeMarketScenario({
+    trendScore: trend.score,
+    instScore: inst.score,
+    brokerScore: broker.score,
+    govScore: gov.score,
+    foreignScore: foreign.score,
+    foreignBuy,
+    trustBuy,
+    govBuy,
+    priceUp,
+    strongVolume,
+    close: latest.close,
+    ma5: ind?.ma5,
+    ma10: ind?.ma10,
+    ma20: ind?.ma20,
+  });
+
   return {
     chipScore: score.chipOverall,
     mainForce: broker.label,
     institution: inst.label,
     broker: broker.label,
     support: gov.label,
-    risk: extended ? '短線漲幅與量能偏熱，跌破5日線需防隔日沖倒貨'
-      : score.broker.score <= 40 ? '分點賣壓偏集中，需留意主力出貨'
-      : score.institution.score >= 65 && trend.score >= 60 ? '籌碼與技術同向，留意續航量'
-      : '訊號未完全同步，適合等待確認',
+    scenario: scenario.title,
+    detail: scenario.detail,
+    risk: scenario.risk,
+    foreign: foreign.label,
+    volume: volume.label,
+  };
+}
+
+function judgeMarketScenario(ctx) {
+  const aboveShortMa = ctx.ma5 && ctx.close >= ctx.ma5;
+  const aboveTrendMa = ctx.ma20 && ctx.close >= ctx.ma20;
+
+  if (ctx.priceUp && ctx.strongVolume && ctx.instScore < 48 && ctx.brokerScore < 45) {
+    return {
+      title: '假突破 / 主力出貨風險',
+      detail: '量增價漲但法人未同步，分點偏賣，可能是拉高換手或出貨。',
+      risk: '若隔日跌破5日線或爆量收黑，需防短線倒貨。',
+    };
+  }
+
+  if (!ctx.priceUp && ctx.foreignBuy > 0 && ctx.trustBuy > 0 && ctx.brokerScore >= 50 && ctx.govBuy >= 0) {
+    return {
+      title: '洗盤換手',
+      detail: '股價回檔但外資/投信仍偏買，分點未明顯出貨，八大也有承接。',
+      risk: '仍需守住10日或20日線，否則換手可能轉弱。',
+    };
+  }
+
+  if (ctx.trustBuy > 0 && aboveShortMa && ctx.trendScore >= 60) {
+    return {
+      title: '投信作帳行情',
+      detail: '投信連買且股價沿短均上攻，籌碼與趨勢同向。',
+      risk: '若投信買超縮小或跌破10日線，作帳動能可能降溫。',
+    };
+  }
+
+  if (!ctx.priceUp && ctx.govBuy > 0) {
+    return {
+      title: '下跌有承接',
+      detail: '股價走弱但八大行庫或官股資金偏買，可能有承接力道。',
+      risk: '承接不等於立即轉強，需等價格重新站回短均。',
+    };
+  }
+
+  if (ctx.priceUp && ctx.strongVolume && ctx.instScore >= 60 && ctx.brokerScore >= 58 && aboveTrendMa) {
+    return {
+      title: '突破可信度較高',
+      detail: '量價突破時法人與主力分點同步偏多，突破品質較佳。',
+      risk: '短線漲幅若過大，仍要留意隔日沖與獲利了結。',
+    };
+  }
+
+  if (ctx.foreignBuy > 0 && ctx.foreignScore <= 55) {
+    return {
+      title: '外資真買待確認',
+      detail: '外資買超但持股變化訊號不強，可能含交易部位或短線調整。',
+      risk: '需觀察外資持股是否連續增加。',
+    };
+  }
+
+  return {
+    title: ctx.trendScore >= 60 ? '偏多但需確認籌碼' : ctx.trendScore <= 40 ? '偏空觀察承接' : '中性換手',
+    detail: '目前訊號未完全同步，需搭配法人、分點、量價與均線位置確認。',
+    risk: '不要只看單一籌碼訊號，需避免被外資套利、分倉或隔日沖誤導。',
   };
 }
 
@@ -908,19 +993,23 @@ function renderAIScorePanel(score, labels) {
     <div class="strategy-box">
       <div class="label">${title}</div>
       <div class="value">${value}</div>
-      <div style="font-size:11px;color:var(--text-2);margin-top:4px;">${note}</div>
+      <div style="font-size:11px;color:var(--text-2);margin-top:4px;line-height:1.5;">${note}</div>
     </div>`;
   return `
     <div class="strategy-grid" style="margin-bottom:12px;">
       ${item('AI 多空評分', score.total + ' / 100', '技術30% 法人25% 分點25% 持股10% 八大10%')}
       ${item('籌碼評分', labels.chipScore + ' / 100', labels.mainForce)}
+      ${item('情境判斷', labels.scenario, labels.detail)}
       ${item('法人態度', labels.institution, score.institution.label)}
-      ${item('主力狀態', labels.mainForce, labels.broker)}
+      ${item('主力分點', labels.broker, '主力出貨 vs 健康換手')}
+      ${item('外資判斷', labels.foreign, '真買 / 交易部位需搭配持股變化')}
       ${item('下跌承接', labels.support, score.governmentBank.label)}
-      ${item('風險提示', labels.risk, score.volumePrice.label)}
+      ${item('量價技術', labels.volume, score.technical.label)}
+      ${item('風險提示', labels.risk, '籌碼資料可能受套利、ETF、分倉、隔日沖影響')}
     </div>
   `;
 }
+
 
 function renderChipDataPanel(chip) {
   if (!chip || !chip.enabled) {
@@ -1253,9 +1342,11 @@ function fmt(v, digits = 2) {
   return v.toFixed(digits);
 }
 function formatVolume(v) {
-  if (v >= 100000000) return (v / 100000000).toFixed(1) + '億';
-  if (v >= 10000) return (v / 10000).toFixed(0) + '萬';
-  return v.toString();
+  const shares = Number(v) || 0;
+  if (shares >= 1000) {
+    return (shares / 1000).toLocaleString('zh-TW', { maximumFractionDigits: 0 }) + '張';
+  }
+  return shares.toLocaleString('zh-TW', { maximumFractionDigits: 0 }) + '股';
 }
 
 function renderStrategy(latest, ind, history) {
