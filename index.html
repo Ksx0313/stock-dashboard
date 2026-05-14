@@ -371,7 +371,7 @@ body {
     </div>
 
     <div class="sidebar-footer">
-      <a id="settingsLink">⚙ 設定 Gemini API Key</a>
+      <a id="settingsLink">⚙ 設定 API Key</a>
       <a id="aboutLink" style="font-size:10px;color:var(--text-3);">v1.3 · 資料延遲約15分鐘</a>
     </div>
   </aside>
@@ -388,13 +388,15 @@ body {
 <!-- API Key Modal -->
 <div id="apiKeyModal" class="modal-overlay">
   <div class="modal">
-    <h3>🔑 設定 Gemini API Key（免費）</h3>
+    <h3>🔑 設定 API Key（免費）</h3>
     <p>
       用於 AI 趨勢分析。Key 只存在你的瀏覽器，不會傳到任何伺服器。<br>
       <a href="https://aistudio.google.com/apikey" target="_blank" style="color:var(--blue);">點此取得免費 API Key →</a>
     </p>
-    <label>API Key（AIza...）</label>
+    <label>Gemini API Key（AIza...）</label>
     <input id="apiKeyInput" type="text" placeholder="AIzaSy..." spellcheck="false" />
+    <label>FinMind Token（選填，啟用法人籌碼）</label>
+    <input id="finmindTokenInput" type="text" placeholder="FinMind API Token" spellcheck="false" />
     <div class="modal-actions">
       <button id="apiKeyCancelBtn">略過（不使用 AI）</button>
       <button id="apiKeySaveBtn" class="primary">儲存</button>
@@ -421,7 +423,7 @@ body {
 <!-- Toast -->
 <div id="toast" class="toast"></div>
 
-<script src="app.js"></script>
+<script src="app_2026-05-14.js"></script>
 
 </body>
 </html>

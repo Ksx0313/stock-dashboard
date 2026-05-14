@@ -488,6 +488,299 @@ function calcAIProbability(history, ind) {
   };
 }
 
+
+// ─── FinMind 籌碼資料（瀏覽器端 Token）────────────────────────────
+function getFinMindToken() {
+  return (localStorage.getItem('finmindToken') || '').trim();
+}
+
+function getRecentStartDate(history, fallbackDays = 45) {
+  if (history && history.length > 20) {
+    return history[Math.max(0, history.length - fallbackDays)]?.date || history[0].date;
+  }
+  const d = new Date();
+  d.setDate(d.getDate() - fallbackDays);
+  return d.toISOString().slice(0, 10);
+}
+
+async function fetchFinMindData(dataset, params = {}) {
+  const token = getFinMindToken();
+  if (!token) return [];
+  const url = new URL('https://api.finmindtrade.com/api/v4/data');
+  url.searchParams.set('dataset', dataset);
+  url.searchParams.set('token', token);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') url.searchParams.set(key, value);
+  });
+  const res = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  if (!res.ok) throw new Error(`FinMind ${dataset} HTTP ${res.status}`);
+  const json = await res.json();
+  if (json.status && json.status !== 200) throw new Error(json.msg || `FinMind ${dataset} failed`);
+  return Array.isArray(json.data) ? json.data : [];
+}
+
+async function fetchFinMindBrokerData(code, startDate, endDate) {
+  const token = getFinMindToken();
+  if (!token) return [];
+  const url = new URL('https://api.finmindtrade.com/api/v4/taiwan_stock_trading_daily_report');
+  url.searchParams.set('data_id', code);
+  url.searchParams.set('start_date', startDate);
+  if (endDate) url.searchParams.set('end_date', endDate);
+  url.searchParams.set('token', token);
+  const res = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  if (!res.ok) throw new Error(`FinMind broker HTTP ${res.status}`);
+  const json = await res.json();
+  if (json.status && json.status !== 200) throw new Error(json.msg || 'FinMind broker failed');
+  return Array.isArray(json.data) ? json.data : [];
+}
+
+async function fetchChipData(code, history) {
+  if (!getFinMindToken()) {
+    return { enabled: false, status: '未設定 FinMind Token' };
+  }
+
+  const startDate = getRecentStartDate(history, 45);
+  const endDate = history?.[history.length - 1]?.date;
+  const requests = {
+    institutional: fetchFinMindData('TaiwanStockInstitutionalInvestorsBuySell', { data_id: code, start_date: startDate, end_date: endDate }),
+    shareholding: fetchFinMindData('TaiwanStockShareholding', { data_id: code, start_date: startDate, end_date: endDate }),
+    governmentBank: fetchFinMindData('TaiwanStockGovernmentBankBuySell', { data_id: code, start_date: startDate, end_date: endDate }),
+    margin: fetchFinMindData('TaiwanStockMarginPurchaseShortSale', { data_id: code, start_date: startDate, end_date: endDate }),
+    brokers: fetchFinMindBrokerData(code, startDate, endDate),
+  };
+
+  const entries = await Promise.all(Object.entries(requests).map(async ([key, promise]) => {
+    try {
+      return [key, await promise, null];
+    } catch (err) {
+      return [key, [], err.message];
+    }
+  }));
+
+  const raw = Object.fromEntries(entries.map(([key, data]) => [key, data]));
+  const errors = Object.fromEntries(entries.filter(([, , err]) => err).map(([key, , err]) => [key, err]));
+
+  return {
+    enabled: true,
+    status: Object.keys(errors).length ? '部分籌碼資料無法取得' : '籌碼資料已載入',
+    errors,
+    startDate,
+    endDate,
+    institutional: summarizeInstitutional(raw.institutional),
+    shareholding: summarizeShareholding(raw.shareholding),
+    governmentBank: summarizeGovernmentBank(raw.governmentBank),
+    margin: summarizeMargin(raw.margin),
+    brokers: summarizeBrokers(raw.brokers),
+  };
+}
+
+function toNumber(value) {
+  if (value === null || value === undefined || value === '') return 0;
+  if (typeof value === 'number') return value;
+  const n = Number(String(value).replace(/,/g, ''));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function getRowDate(row) {
+  return row.date || row.Date || row.transaction_date || '';
+}
+
+function netValue(row) {
+  const direct = row.buy_sell ?? row.buy_sell_amount ?? row.net_buy_sell ?? row.BuySell ?? row.net;
+  if (direct !== undefined && direct !== null && direct !== '') return toNumber(direct);
+  return toNumber(row.buy ?? row.Buy ?? row.buy_amount) - toNumber(row.sell ?? row.Sell ?? row.sell_amount);
+}
+
+function latestRows(rows) {
+  if (!rows || !rows.length) return [];
+  const dates = [...new Set(rows.map(getRowDate).filter(Boolean))].sort();
+  const latestDate = dates[dates.length - 1];
+  return rows.filter(r => getRowDate(r) === latestDate);
+}
+
+function sumLastNDays(rows, n, predicate = () => true) {
+  if (!rows || !rows.length) return 0;
+  const dates = [...new Set(rows.map(getRowDate).filter(Boolean))].sort().slice(-n);
+  const dateSet = new Set(dates);
+  return rows
+    .filter(r => dateSet.has(getRowDate(r)) && predicate(r))
+    .reduce((sum, row) => sum + netValue(row), 0);
+}
+
+function normalizeInstType(row) {
+  const raw = String(row.name || row.type || row.investor || row.InstitutionalInvestors || '').toLowerCase();
+  if (raw.includes('foreign') || raw.includes('外資')) return 'foreign';
+  if (raw.includes('trust') || raw.includes('投信')) return 'trust';
+  if (raw.includes('dealer') || raw.includes('自營')) return 'dealer';
+  return raw || 'other';
+}
+
+function summarizeInstitutional(rows) {
+  const labels = { foreign: '外資', trust: '投信', dealer: '自營商' };
+  const out = {};
+  for (const key of Object.keys(labels)) {
+    const pred = row => normalizeInstType(row) === key;
+    out[key] = {
+      label: labels[key],
+      d1: sumLastNDays(rows, 1, pred),
+      d5: sumLastNDays(rows, 5, pred),
+      d20: sumLastNDays(rows, 20, pred),
+    };
+  }
+  out.total = {
+    label: '三大法人合計',
+    d1: sumLastNDays(rows, 1),
+    d5: sumLastNDays(rows, 5),
+    d20: sumLastNDays(rows, 20),
+  };
+  return out;
+}
+
+function summarizeShareholding(rows) {
+  const latest = latestRows(rows)[0];
+  if (!latest) return null;
+  const ratio = latest.ForeignInvestmentSharesRatio ?? latest.foreign_investment_shares_ratio ?? latest.ratio;
+  const shares = latest.ForeignInvestmentShares ?? latest.foreign_investment_shares ?? latest.shares;
+  return {
+    date: getRowDate(latest),
+    ratio: ratio === undefined ? null : toNumber(ratio),
+    shares: shares === undefined ? null : toNumber(shares),
+  };
+}
+
+function summarizeGovernmentBank(rows) {
+  return {
+    d1: sumLastNDays(rows, 1),
+    d5: sumLastNDays(rows, 5),
+    d20: sumLastNDays(rows, 20),
+  };
+}
+
+function summarizeMargin(rows) {
+  const latest = latestRows(rows)[0];
+  if (!latest) return null;
+  return {
+    date: getRowDate(latest),
+    marginBalance: toNumber(latest.MarginPurchaseTodayBalance ?? latest.margin_purchase_today_balance ?? latest.MarginPurchaseLimit),
+    shortBalance: toNumber(latest.ShortSaleTodayBalance ?? latest.short_sale_today_balance ?? latest.ShortSaleLimit),
+  };
+}
+
+function summarizeBrokers(rows) {
+  const latest = latestRows(rows);
+  const mapped = latest.map(row => {
+    const buy = toNumber(row.buy ?? row.Buy);
+    const sell = toNumber(row.sell ?? row.Sell);
+    const net = netValue(row);
+    return {
+      name: row.securities_trader_name || row.SecuritiesTraderName || row.broker_name || row.name || row.securities_trader_id || '券商',
+      buy,
+      sell,
+      net,
+    };
+  }).filter(row => row.net !== 0);
+  const buyTop = [...mapped].sort((a, b) => b.net - a.net).slice(0, 5);
+  const sellTop = [...mapped].sort((a, b) => a.net - b.net).slice(0, 5);
+  const totalAbs = mapped.reduce((sum, row) => sum + Math.abs(row.net), 0);
+  const topAbs = buyTop.concat(sellTop).reduce((sum, row) => sum + Math.abs(row.net), 0);
+  return {
+    date: latest[0] ? getRowDate(latest[0]) : '',
+    buyTop,
+    sellTop,
+    concentration: totalAbs ? Math.round(topAbs / totalAbs * 100) : 0,
+  };
+}
+
+function formatLots(value) {
+  const lots = toNumber(value) / 1000;
+  const abs = Math.abs(lots);
+  if (!Number.isFinite(lots)) return '--';
+  const text = abs >= 1000 ? lots.toLocaleString('zh-TW', { maximumFractionDigits: 0 }) : lots.toLocaleString('zh-TW', { maximumFractionDigits: 1 });
+  return `${lots > 0 ? '+' : ''}${text}張`;
+}
+
+function formatSignedNumber(value, suffix = '') {
+  const n = toNumber(value);
+  return `${n > 0 ? '+' : ''}${n.toLocaleString('zh-TW', { maximumFractionDigits: 2 })}${suffix}`;
+}
+
+function chipValueClass(value) {
+  const n = toNumber(value);
+  return n > 0 ? 'up' : n < 0 ? 'dn' : '';
+}
+
+function renderChipDataPanel(chip) {
+  if (!chip || !chip.enabled) {
+    return `
+      <div class="strategy-box" style="grid-column:1/-1;">
+        <div class="label">FinMind 籌碼資料</div>
+        <div class="value" style="font-size:13px;">未設定 Token</div>
+      </div>
+      <div style="font-size:11px;color:var(--text-2);margin-top:10px;">
+        到設定填入 FinMind Token 後，會自動加入三大法人、外資持股、券商分點、八大行庫與融資融券資料。
+      </div>
+    `;
+  }
+
+  const inst = chip.institutional || {};
+  const instRows = ['foreign', 'trust', 'dealer', 'total'].map(key => {
+    const row = inst[key] || { label: key, d1: 0, d5: 0, d20: 0 };
+    return `
+      <div class="indicator-row">
+        <span class="label">${row.label}</span>
+        <span class="value ${chipValueClass(row.d1)}">${formatLots(row.d1)}</span>
+        <span class="value ${chipValueClass(row.d5)}">${formatLots(row.d5)}</span>
+        <span class="value ${chipValueClass(row.d20)}">${formatLots(row.d20)}</span>
+      </div>`;
+  }).join('');
+
+  const brokers = chip.brokers || {};
+  const brokerLine = list => (list || []).map(row => `${row.name} ${formatLots(row.net)}`).join('、') || '無資料';
+  const share = chip.shareholding;
+  const margin = chip.margin;
+
+  return `
+    <div style="font-size:11px;color:var(--text-2);margin-bottom:10px;">
+      區間：${chip.startDate || '--'} ~ ${chip.endDate || '--'}；${chip.status || ''}
+    </div>
+    <div class="indicator-table" style="grid-template-columns:1fr;">
+      <div class="indicator-row" style="color:var(--text-2);font-size:11px;">
+        <span></span><span>1日</span><span>5日</span><span>20日</span>
+      </div>
+      ${instRows}
+    </div>
+    <div class="strategy-grid" style="margin-top:12px;">
+      <div class="strategy-box"><div class="label">外資持股比</div><div class="value">${share?.ratio != null ? share.ratio.toFixed(2) + '%' : '--'}</div></div>
+      <div class="strategy-box"><div class="label">八大行庫 5日</div><div class="value ${chipValueClass(chip.governmentBank?.d5)}">${formatLots(chip.governmentBank?.d5 || 0)}</div></div>
+      <div class="strategy-box"><div class="label">分點集中度</div><div class="value">${brokers.concentration || 0}%</div></div>
+      <div class="strategy-box"><div class="label">融資 / 融券</div><div class="value" style="font-size:12px;">${margin ? `${formatSignedNumber(margin.marginBalance)} / ${formatSignedNumber(margin.shortBalance)}` : '--'}</div></div>
+    </div>
+    <div style="font-size:11px;color:var(--text-1);margin-top:10px;line-height:1.7;">
+      <div><b style="color:var(--up);">買超分點</b>：${brokerLine(brokers.buyTop)}</div>
+      <div><b style="color:var(--dn);">賣超分點</b>：${brokerLine(brokers.sellTop)}</div>
+    </div>
+  `;
+}
+
+function buildChipPrompt(chip) {
+  if (!chip || !chip.enabled) return '- 籌碼資料：未設定 FinMind Token';
+  const inst = chip.institutional || {};
+  const brokers = chip.brokers || {};
+  const topBuy = brokers.buyTop?.[0];
+  const topSell = brokers.sellTop?.[0];
+  return `
+- 外資買賣超 1/5/20日：${formatLots(inst.foreign?.d1 || 0)} / ${formatLots(inst.foreign?.d5 || 0)} / ${formatLots(inst.foreign?.d20 || 0)}
+- 投信買賣超 1/5/20日：${formatLots(inst.trust?.d1 || 0)} / ${formatLots(inst.trust?.d5 || 0)} / ${formatLots(inst.trust?.d20 || 0)}
+- 自營商買賣超 1/5/20日：${formatLots(inst.dealer?.d1 || 0)} / ${formatLots(inst.dealer?.d5 || 0)} / ${formatLots(inst.dealer?.d20 || 0)}
+- 外資持股比例：${chip.shareholding?.ratio != null ? chip.shareholding.ratio.toFixed(2) + '%' : '無資料'}
+- 八大行庫 1/5/20日：${formatLots(chip.governmentBank?.d1 || 0)} / ${formatLots(chip.governmentBank?.d5 || 0)} / ${formatLots(chip.governmentBank?.d20 || 0)}
+- 分點集中度：${brokers.concentration || 0}%；買超最大：${topBuy ? topBuy.name + ' ' + formatLots(topBuy.net) : '無'}；賣超最大：${topSell ? topSell.name + ' ' + formatLots(topSell.net) : '無'}`.trim();
+}
+
 async function loadStock(stock) {
   currentStock = stock;
   document.querySelectorAll('.stock-item').forEach(el => el.classList.remove('active'));
@@ -518,13 +811,14 @@ async function loadStock(stock) {
       return;
     }
     if (!stock.name) stock.name = stock.code;
-    renderDashboard(stock, history);
+    const chip = await fetchChipData(stock.code, history);
+    renderDashboard(stock, history, chip);
   } catch(e) {
     main.innerHTML = `<div class="error-banner">⚠ 載入失敗：${e.message}</div>`;
   }
 }
 
-function renderDashboard(stock, history) {
+function renderDashboard(stock, history, chip = null) {
   const closes = history.map(h => h.close);
   const highs  = history.map(h => h.high);
   const lows   = history.map(h => h.low);
@@ -696,8 +990,15 @@ function renderDashboard(stock, history) {
         ${renderStrategy(latest, indicators, history)}
       </div>
       <div class="panel">
-        <div class="panel-title">📊 籌碼概況</div>
+        <div class="panel-title">📊 量價概況</div>
         ${renderChipAnalysis(history, indicators)}
+      </div>
+      <div class="panel full-row">
+        <div class="panel-title">
+          <span>🏦 法人籌碼 / 分點</span>
+          <span class="badge">${chip?.enabled ? 'FinMind' : '未設定 Token'}</span>
+        </div>
+        ${renderChipDataPanel(chip)}
       </div>
     </div>
   `;
@@ -709,7 +1010,7 @@ function renderDashboard(stock, history) {
   }, 50);
 
   if (hasGemini) {
-    runAIAnalysis(stock, latest, indicators, pattern, signals, history);
+    runAIAnalysis(stock, latest, indicators, pattern, signals, history, chip);
   }
 }
 
@@ -914,7 +1215,7 @@ function bindChartToolbar(stock) {
   });
 }
 
-async function runAIAnalysis(stock, latest, ind, pattern, signals, history) {
+async function runAIAnalysis(stock, latest, ind, pattern, signals, history, chip = null) {
   const apiKey = localStorage.getItem('geminiApiKey');
   if (!apiKey) return;
   const el = document.getElementById('aiAnalysis');
@@ -932,6 +1233,9 @@ async function runAIAnalysis(stock, latest, ind, pattern, signals, history) {
 - MACD OSC: ${fmt(ind.macd_osc, 3)}
 - 趨勢型態: ${pattern.name}
 - 近10日收盤: ${recent10}
+
+籌碼面：
+${buildChipPrompt(chip)}
 
 請以四段呈現（用兩個換行分隔，不用標題符號）：
 1. 趨勢判斷
@@ -966,6 +1270,8 @@ async function runAIAnalysis(stock, latest, ind, pattern, signals, history) {
 function showApiKeyModal() {
   document.getElementById('apiKeyModal').classList.add('show');
   document.getElementById('apiKeyInput').value = localStorage.getItem('geminiApiKey') || '';
+  const finmindInput = document.getElementById('finmindTokenInput');
+  if (finmindInput) finmindInput.value = localStorage.getItem('finmindToken') || '';
   setTimeout(() => document.getElementById('apiKeyInput').focus(), 100);
 }
 function hideApiKeyModal() {
@@ -973,11 +1279,17 @@ function hideApiKeyModal() {
 }
 function saveApiKey() {
   const key = document.getElementById('apiKeyInput').value.trim();
+  const finmindKey = document.getElementById('finmindTokenInput')?.value.trim() || '';
   if (key) {
     localStorage.setItem('geminiApiKey', key);
     localStorage.removeItem('apiKeyDismissed');
   } else {
     localStorage.removeItem('geminiApiKey');
+  }
+  if (finmindKey) {
+    localStorage.setItem('finmindToken', finmindKey);
+  } else {
+    localStorage.removeItem('finmindToken');
   }
   hideApiKeyModal();
   if (currentStock) loadStock(currentStock);
