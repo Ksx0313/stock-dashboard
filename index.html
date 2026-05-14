@@ -397,6 +397,8 @@ body {
     <input id="apiKeyInput" type="text" placeholder="AIzaSy..." spellcheck="false" />
     <label>FinMind Token（選填，啟用法人籌碼）</label>
     <input id="finmindTokenInput" type="text" placeholder="FinMind API Token" spellcheck="false" />
+    <label>FinMind Proxy URL（選填，解決 GitHub Pages CORS）</label>
+    <input id="finmindProxyInput" type="text" placeholder="https://your-worker.workers.dev" spellcheck="false" />
     <div class="modal-actions">
       <button id="apiKeyCancelBtn">略過（不使用 AI）</button>
       <button id="apiKeySaveBtn" class="primary">儲存</button>
@@ -423,7 +425,7 @@ body {
 <!-- Toast -->
 <div id="toast" class="toast"></div>
 
-<script src="stock-dashboard.js?v=20260514-2"></script>
+<script src="stock-dashboard.js?v=20260514-3"></script>
 
 </body>
 </html>

@@ -542,6 +542,10 @@ function getRecentStartDate(history, fallbackDays = 45) {
 async function fetchFinMindData(dataset, params = {}) {
   const token = getFinMindToken();
   if (!token) return [];
+  const proxyUrl = getFinMindProxyUrl();
+  if (proxyUrl) {
+    return fetchFinMindProxy(proxyUrl, { endpoint: 'data', dataset, ...params });
+  }
   const url = new URL('https://api.finmindtrade.com/api/v4/data');
   url.searchParams.set('dataset', dataset);
   url.searchParams.set('token', token);
@@ -560,6 +564,14 @@ async function fetchFinMindData(dataset, params = {}) {
 async function fetchFinMindBrokerData(code, startDate, endDate) {
   const token = getFinMindToken();
   if (!token) return [];
+  const proxyUrl = getFinMindProxyUrl();
+  if (proxyUrl) {
+    return fetchFinMindProxy(proxyUrl, {
+      endpoint: 'taiwan_stock_trading_daily_report',
+      data_id: code,
+      date: endDate || startDate,
+    });
+  }
   const url = new URL('https://api.finmindtrade.com/api/v4/taiwan_stock_trading_daily_report');
   url.searchParams.set('data_id', code);
   url.searchParams.set('date', endDate || startDate);
@@ -570,6 +582,24 @@ async function fetchFinMindBrokerData(code, startDate, endDate) {
   if (!res.ok) throw new Error(`FinMind broker HTTP ${res.status}`);
   const json = await res.json();
   if (json.status && json.status !== 200) throw new Error(json.msg || 'FinMind broker failed');
+  return Array.isArray(json.data) ? json.data : [];
+}
+
+function getFinMindProxyUrl() {
+  return (localStorage.getItem('finmindProxyUrl') || '').trim().replace(/\/$/, '');
+}
+
+async function fetchFinMindProxy(proxyUrl, params = {}) {
+  const token = getFinMindToken();
+  const url = new URL(proxyUrl);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') url.searchParams.set(key, value);
+  });
+  url.searchParams.set('token', token);
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(`FinMind proxy HTTP ${res.status}`);
+  const json = await res.json();
+  if (json.status && json.status !== 200) throw new Error(json.msg || 'FinMind proxy failed');
   return Array.isArray(json.data) ? json.data : [];
 }
 
@@ -1329,6 +1359,8 @@ function showApiKeyModal() {
   document.getElementById('apiKeyInput').value = localStorage.getItem('geminiApiKey') || '';
   const finmindInput = document.getElementById('finmindTokenInput');
   if (finmindInput) finmindInput.value = localStorage.getItem('finmindToken') || '';
+  const proxyInput = document.getElementById('finmindProxyInput');
+  if (proxyInput) proxyInput.value = localStorage.getItem('finmindProxyUrl') || '';
   setTimeout(() => document.getElementById('apiKeyInput').focus(), 100);
 }
 function hideApiKeyModal() {
@@ -1337,6 +1369,7 @@ function hideApiKeyModal() {
 function saveApiKey() {
   const key = document.getElementById('apiKeyInput').value.trim();
   const finmindKey = document.getElementById('finmindTokenInput')?.value.trim() || '';
+  const finmindProxy = document.getElementById('finmindProxyInput')?.value.trim() || '';
   if (key) {
     localStorage.setItem('geminiApiKey', key);
     localStorage.removeItem('apiKeyDismissed');
@@ -1347,6 +1380,11 @@ function saveApiKey() {
     localStorage.setItem('finmindToken', finmindKey);
   } else {
     localStorage.removeItem('finmindToken');
+  }
+  if (finmindProxy) {
+    localStorage.setItem('finmindProxyUrl', finmindProxy);
+  } else {
+    localStorage.removeItem('finmindProxyUrl');
   }
   hideApiKeyModal();
   if (currentStock) loadStock(currentStock);
