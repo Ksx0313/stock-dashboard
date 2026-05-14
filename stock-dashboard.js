@@ -27,6 +27,7 @@ let WATCH_LIST = loadWatchList();
 let currentStock = null;
 let priceChart = null;
 let chartRange = '4mo';
+let pendingAIAnalysis = null;
 
 function loadWatchList() {
   try {
@@ -64,6 +65,9 @@ function bindEvents() {
     }
   });
   document.getElementById('refreshAllBtn').addEventListener('click', loadAllWatchlistPrices);
+  document.addEventListener('click', e => {
+    if (e.target && e.target.id === 'generateAiBtn') generateCurrentAIAnalysis();
+  });
   document.getElementById('settingsLink').addEventListener('click', showApiKeyModal);
   document.getElementById('apiKeySaveBtn').addEventListener('click', saveApiKey);
   document.getElementById('apiKeyCancelBtn').addEventListener('click', () => {
@@ -1518,7 +1522,11 @@ function renderDashboard(stock, history, chip = null) {
         <span>🧠 AI 深度分析</span>
         <span class="badge" id="aiBadge">${hasGemini ? 'Gemini AI' : '未設定 API'}</span>
       </div>
-      <div id="aiAnalysis" class="ai-text loading">${hasGemini ? '🤖 AI 正在分析中...' : '💡 設定 Gemini API Key 即可啟用 AI 趨勢分析（免費）'}</div>
+      <div id="aiAnalysis" class="ai-text">
+        ${hasGemini
+          ? `<button id="generateAiBtn" class="add-to-watchlist" style="margin:0 0 10px 0;">生成分析</button><div style="color:var(--text-2);font-size:12px;">按下後才會呼叫 Gemini，避免用完免費額度。</div>`
+          : '💡 設定 Gemini API Key 即可啟用 AI 趨勢分析（免費）'}
+      </div>
     </div>
 
     ${renderTacticalPanels(tactical)}
@@ -1549,9 +1557,7 @@ function renderDashboard(stock, history, chip = null) {
     bindChartToolbar(stock);
   }, 50);
 
-  if (hasGemini) {
-    runAIAnalysis(stock, latest, indicators, pattern, signals, history, chip);
-  }
+  pendingAIAnalysis = { stock, latest, indicators, pattern, signals, history, chip };
 }
 
 function addCurrentToWatchlist() {
@@ -1757,11 +1763,41 @@ function bindChartToolbar(stock) {
   });
 }
 
+function generateCurrentAIAnalysis() {
+  if (!pendingAIAnalysis) return;
+  const btn = document.getElementById('generateAiBtn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '分析中...';
+  }
+  runAIAnalysis(
+    pendingAIAnalysis.stock,
+    pendingAIAnalysis.latest,
+    pendingAIAnalysis.indicators,
+    pendingAIAnalysis.pattern,
+    pendingAIAnalysis.signals,
+    pendingAIAnalysis.history,
+    pendingAIAnalysis.chip
+  );
+}
+
+function friendlyAIError(message) {
+  const msg = String(message || '');
+  if (msg.includes('quota') || msg.includes('rate') || msg.includes('429')) {
+    return 'Gemini 免費額度或頻率已達上限，請稍後再按「生成分析」。本頁的多空評分、籌碼評分與風險提示仍可正常使用。';
+  }
+  if (msg.includes('API key')) return 'Gemini API Key 可能無效，請到設定重新確認。';
+  return `AI 分析暫時無法產生：${msg}`;
+}
+
 async function runAIAnalysis(stock, latest, ind, pattern, signals, history, chip = null) {
   const apiKey = localStorage.getItem('geminiApiKey');
   if (!apiKey) return;
   const el = document.getElementById('aiAnalysis');
   if (!el) return;
+  el.classList.add('loading');
+  el.style.color = '';
+  el.textContent = '🤖 AI 正在分析中...';
 
   const recent10 = history.slice(-10).map(h => `${h.date} ${h.close.toFixed(2)}`).join(', ');
 
