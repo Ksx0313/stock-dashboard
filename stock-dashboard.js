@@ -470,8 +470,94 @@ function updateWatchlistPrice(code, data) {
 }
 
 // ─── 資料抓取 (Yahoo Finance + CORS proxy) ──────────────────
+function parseTwseNumber(value) {
+  if (value === undefined || value === null || value === '-' || value === '--') return null;
+  const n = Number(String(value).replace(/,/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+async function fetchTwseRealtimeQuote(code, type) {
+  const proxyUrl = getFinMindProxyUrl();
+  if (!proxyUrl) return null;
+  try {
+    const url = new URL(proxyUrl);
+    url.searchParams.set('endpoint', 'twse_quote');
+    url.searchParams.set('code', code);
+    url.searchParams.set('market', type || 'TW');
+    url.searchParams.set('_', Date.now().toString());
+    const res = await fetch(url.toString(), { cache: 'no-store' });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const q = json.data;
+    if (!q) return null;
+    const price = parseTwseNumber(q.z);
+    const prev = parseTwseNumber(q.y);
+    if (!price || !prev) return null;
+    const open = parseTwseNumber(q.o) || price;
+    const high = parseTwseNumber(q.h) || price;
+    const low = parseTwseNumber(q.l) || price;
+    const volumeLots = parseTwseNumber(q.v) || 0;
+    const dateRaw = String(q.d || '');
+    const date = dateRaw.length === 8
+      ? `${dateRaw.slice(0, 4)}-${dateRaw.slice(4, 6)}-${dateRaw.slice(6, 8)}`
+      : new Date().toISOString().slice(0, 10);
+    const change = price - prev;
+    return {
+      price,
+      change,
+      changePct: prev ? change / prev * 100 : 0,
+      date,
+      open,
+      high,
+      low,
+      close: price,
+      volume: Math.round(volumeLots * 1000),
+      source: 'TWSE MIS',
+    };
+  } catch(e) {
+    return null;
+  }
+}
+
+async function fetchTwseDailyHistory(code, type) {
+  const proxyUrl = getFinMindProxyUrl();
+  if (!proxyUrl || type === 'TWO') return [];
+  try {
+    const url = new URL(proxyUrl);
+    url.searchParams.set('endpoint', 'twse_daily');
+    url.searchParams.set('code', code);
+    url.searchParams.set('date', new Date().toISOString().slice(0, 7).replace('-', '') + '01');
+    url.searchParams.set('_', Date.now().toString());
+    const res = await fetch(url.toString(), { cache: 'no-store' });
+    if (!res.ok) return [];
+    const json = await res.json();
+    return (json.data || []).map(row => ({
+      time: Math.floor(new Date(row.date + 'T00:00:00+08:00').getTime() / 1000),
+      date: row.date,
+      open: round2(row.open),
+      high: round2(row.high),
+      low: round2(row.low),
+      close: round2(row.close),
+      volume: Math.round(row.volume || 0),
+      source: 'TWSE STOCK_DAY',
+    })).filter(row => row.date && row.close);
+  } catch(e) {
+    return [];
+  }
+}
+
+async function mergeTwseDailyHistory(code, type, history) {
+  const twseRows = await fetchTwseDailyHistory(code, type);
+  if (!twseRows.length) return history;
+  const byDate = new Map(history.map(row => [row.date, row]));
+  for (const row of twseRows) byDate.set(row.date, row);
+  return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+}
+
 async function fetchYahooQuote(code, type) {
   try {
+    const twseQuote = await fetchTwseRealtimeQuote(code, type);
+    if (twseQuote) return twseQuote;
     const data = await fetchYahooHistory(code, type, '5d');
     if (!data || data.length < 1) return null;
     const last = data[data.length - 1];
@@ -1858,14 +1944,16 @@ async function fetchStockNews(code, stockName = '') {
   try {
     const url = new URL(proxyUrl);
     url.searchParams.set('endpoint', 'news');
-    url.searchParams.set('q', [code, stockName, '股票'].filter(Boolean).join(' '));
+    const keyword = stockName ? `${stockName} ${code} 台股` : `${code} 台股`;
+    url.searchParams.set('q', keyword);
     const res = await fetch(url.toString());
     if (!res.ok) throw new Error('news HTTP ' + res.status);
     const json = await res.json();
+    const items = Array.isArray(json.data) ? json.data.slice(0, 5) : [];
     return {
       enabled: true,
-      status: json.status === 200 ? '新聞已載入' : (json.msg || '新聞無資料'),
-      items: Array.isArray(json.data) ? json.data.slice(0, 5) : [],
+      status: items.length ? '新聞已載入' : '查無近期新聞',
+      items,
     };
   } catch (err) {
     return { enabled: true, status: err.message, items: [] };
@@ -1926,9 +2014,11 @@ function escapeHtml(value) {
 async function syncHistoryWithLatestQuote(code, type, history) {
   if (!history || !history.length) return history;
   try {
+    history = await mergeTwseDailyHistory(code, type, history);
     const recent = await fetchYahooHistory(code, type, '5d');
     if (!recent || !recent.length) return history;
-    const latest = recent[recent.length - 1];
+    const realtime = await fetchTwseRealtimeQuote(code, type);
+    const latest = realtime || recent[recent.length - 1];
     const index = history.findIndex(row => row.date === latest.date);
     if (index >= 0) {
       history[index] = latest;
