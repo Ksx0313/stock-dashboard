@@ -1320,6 +1320,105 @@ function buildChipPrompt(chip) {
 - 分點集中度：${brokers.concentration || 0}%；買超最大：${topBuy ? topBuy.name + ' ' + formatLots(topBuy.net) : '無'}；賣超最大：${topSell ? topSell.name + ' ' + formatLots(topSell.net) : '無'}`.trim();
 }
 
+async function fetchFundamentalData(code, stockName = '') {
+  if (!getFinMindToken()) return { enabled: false, eps: null, status: '未設定 FinMind Token' };
+  const d = new Date();
+  d.setFullYear(d.getFullYear() - 2);
+  const startDate = d.toISOString().slice(0, 10);
+  try {
+    const rows = await fetchFinMindData('TaiwanStockFinancialStatements', { data_id: code, start_date: startDate });
+    const epsRows = rows
+      .filter(row => String(row.type || row.account || '').toUpperCase() === 'EPS')
+      .sort((a, b) => String(a.date || '').localeCompare(String(b.date || '')));
+    const latest = epsRows[epsRows.length - 1];
+    const prev = epsRows[epsRows.length - 2];
+    return {
+      enabled: true,
+      status: latest ? 'EPS 已載入' : '查無 EPS',
+      eps: latest ? {
+        date: latest.date,
+        value: toNumber(latest.value),
+        previous: prev ? toNumber(prev.value) : null,
+        yoyHint: prev ? toNumber(latest.value) - toNumber(prev.value) : null,
+        originName: latest.origin_name || latest.account_name || '基本每股盈餘',
+      } : null,
+    };
+  } catch (err) {
+    return { enabled: true, eps: null, status: err.message };
+  }
+}
+
+async function fetchStockNews(code, stockName = '') {
+  const proxyUrl = getFinMindProxyUrl();
+  if (!proxyUrl) return { enabled: false, status: '未設定 Proxy URL', items: [] };
+  try {
+    const url = new URL(proxyUrl);
+    url.searchParams.set('endpoint', 'news');
+    url.searchParams.set('q', [code, stockName, '股票'].filter(Boolean).join(' '));
+    const res = await fetch(url.toString());
+    if (!res.ok) throw new Error('news HTTP ' + res.status);
+    const json = await res.json();
+    return {
+      enabled: true,
+      status: json.status === 200 ? '新聞已載入' : (json.msg || '新聞無資料'),
+      items: Array.isArray(json.data) ? json.data.slice(0, 5) : [],
+    };
+  } catch (err) {
+    return { enabled: true, status: err.message, items: [] };
+  }
+}
+
+function renderFundamentalNewsPanel(fundamental, news) {
+  const eps = fundamental?.eps;
+  const epsTrend = eps?.previous == null ? '無前期比較'
+    : eps.value > eps.previous ? '較前期成長'
+    : eps.value < eps.previous ? '較前期衰退'
+    : '持平';
+  const newsItems = news?.items || [];
+  return `
+    <div class="grid">
+      <div class="panel">
+        <div class="panel-title">
+          <span>📘 上季 EPS</span>
+          <span class="badge">FinMind</span>
+        </div>
+        <div class="strategy-grid">
+          <div class="strategy-box"><div class="label">最新季度</div><div class="value">${eps?.date || '--'}</div></div>
+          <div class="strategy-box"><div class="label">EPS</div><div class="value">${eps ? eps.value.toFixed(2) : '--'}</div></div>
+          <div class="strategy-box"><div class="label">前期 EPS</div><div class="value">${eps?.previous != null ? eps.previous.toFixed(2) : '--'}</div></div>
+          <div class="strategy-box"><div class="label">變化</div><div class="value ${eps?.yoyHint > 0 ? 'up' : eps?.yoyHint < 0 ? 'dn' : ''}">${eps?.yoyHint != null ? (eps.yoyHint > 0 ? '+' : '') + eps.yoyHint.toFixed(2) : '--'}</div></div>
+        </div>
+        <div style="font-size:12px;color:var(--text-2);margin-top:10px;">
+          ${fundamental?.status || ''}；${epsTrend}。EPS 屬基本面，不代表短線股價一定同步反映。
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">
+          <span>📰 相關新聞</span>
+          <span class="badge">Google News</span>
+        </div>
+        <div style="display:grid;gap:8px;">
+          ${newsItems.length ? newsItems.map(item => `
+            <a href="${item.link}" target="_blank" rel="noopener" style="display:block;color:var(--text-0);text-decoration:none;border-bottom:1px solid var(--border);padding-bottom:8px;">
+              <div style="font-size:13px;font-weight:600;line-height:1.5;">${escapeHtml(item.title)}</div>
+              <div style="font-size:11px;color:var(--text-2);margin-top:3px;">${escapeHtml(item.source || '')} · ${escapeHtml(item.pubDate || '')}</div>
+            </a>
+          `).join('') : `<div style="font-size:12px;color:var(--text-2);">${news?.status || '無新聞資料'}</div>`}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+}
+
 async function loadStock(stock) {
   currentStock = stock;
   document.querySelectorAll('.stock-item').forEach(el => el.classList.remove('active'));
@@ -1350,14 +1449,18 @@ async function loadStock(stock) {
       return;
     }
     if (!stock.name) stock.name = stock.code;
-    const chip = await fetchChipData(stock.code, history);
-    renderDashboard(stock, history, chip);
+    const [chip, fundamental, news] = await Promise.all([
+      fetchChipData(stock.code, history),
+      fetchFundamentalData(stock.code, stock.name),
+      fetchStockNews(stock.code, stock.name),
+    ]);
+    renderDashboard(stock, history, chip, fundamental, news);
   } catch(e) {
     main.innerHTML = `<div class="error-banner">⚠ 載入失敗：${e.message}</div>`;
   }
 }
 
-function renderDashboard(stock, history, chip = null) {
+function renderDashboard(stock, history, chip = null, fundamental = null, news = null) {
   const closes = history.map(h => h.close);
   const highs  = history.map(h => h.high);
   const lows   = history.map(h => h.low);
@@ -1528,6 +1631,8 @@ function renderDashboard(stock, history, chip = null) {
           : '💡 設定 Gemini API Key 即可啟用 AI 趨勢分析（免費）'}
       </div>
     </div>
+
+    ${renderFundamentalNewsPanel(fundamental, news)}
 
     ${renderTacticalPanels(tactical)}
 
@@ -1814,6 +1919,10 @@ async function runAIAnalysis(stock, latest, ind, pattern, signals, history, chip
 
 籌碼面：
 ${buildChipPrompt(chip)}
+
+基本面與新聞：
+- 最新 EPS：${fundamental?.eps ? fundamental.eps.value.toFixed(2) + '（' + fundamental.eps.date + '）' : '無資料'}
+- 新聞摘要：${(news?.items || []).slice(0, 3).map(item => item.title).join('；') || '無新聞資料'}
 
 請以四段呈現（用兩個換行分隔，不用標題符號）：
 1. 趨勢判斷
