@@ -625,6 +625,7 @@ function getAIScoreLabels(score, history, ind, chip) {
   const priceUp = latest.close >= prev.close;
   const strongVolume = (volume?.volumeRatio || 1) >= 1.3;
 
+  const attribution = judgeMoneyFlowAttribution(score, history, ind, chip);
   const scenario = judgeMarketScenario({
     trendScore: trend.score,
     instScore: inst.score,
@@ -650,10 +651,68 @@ function getAIScoreLabels(score, history, ind, chip) {
     support: gov.label,
     scenario: scenario.title,
     detail: scenario.detail,
+    moneySource: attribution.source,
+    tradeStructure: attribution.structure,
+    attributionReason: attribution.reason,
     risk: scenario.risk,
     foreign: foreign.label,
     volume: volume.label,
   };
+}
+
+function judgeMoneyFlowAttribution(score, history, ind, chip) {
+  if (!chip || !chip.enabled) {
+    return {
+      source: '籌碼資料不足',
+      structure: '等待資料',
+      reason: '尚未取得法人、分點與外資持股資料。',
+    };
+  }
+
+  const latest = history?.[history.length - 1] || {};
+  const prev = history?.[history.length - 2] || latest;
+  const priceUp = latest.close >= prev.close;
+  const volumeRatio = score.volumePrice?.volumeRatio || 1;
+  const strongVolume = volumeRatio >= 1.25;
+  const aboveMa5 = ind?.ma5 && latest.close >= ind.ma5;
+  const aboveMa10 = ind?.ma10 && latest.close >= ind.ma10;
+  const foreignBuy = toNumber(chip.institutional?.foreign?.d5);
+  const trustBuy = toNumber(chip.institutional?.trust?.d5);
+  const dealerBuy = toNumber(chip.institutional?.dealer?.d5);
+  const totalInst = toNumber(chip.institutional?.total?.d5);
+  const govBuy = toNumber(chip.governmentBank?.d5);
+  const brokerScore = score.broker?.score || 50;
+  const brokerBuyRatio = score.broker?.buyRatio || 50;
+  const concentration = score.broker?.concentration || 0;
+  const foreignHoldingScore = score.foreignHolding?.score || 50;
+
+  let source = '中性換手';
+  if (trustBuy > 0 && aboveMa5 && aboveMa10) source = '投信主導';
+  else if (foreignBuy > 0 && foreignHoldingScore >= 55) source = '外資主導';
+  else if (brokerScore >= 60 && concentration >= 45) source = '主力分點主導';
+  else if (priceUp && strongVolume && totalInst <= 0 && brokerBuyRatio < 50) source = '散戶追價 / 主力調節';
+  else if (!priceUp && totalInst < 0 && brokerScore < 45) source = '賣壓主導';
+  else if (govBuy > 0 && !priceUp) source = '官股承接';
+  else if (foreignBuy > 0 || trustBuy > 0 || dealerBuy > 0) source = '法人偏買';
+
+  let structure = '健康換手';
+  if (priceUp && strongVolume && brokerScore >= 60 && totalInst > 0) structure = '吃貨攻擊';
+  else if (priceUp && strongVolume && brokerScore < 45 && totalInst <= 0) structure = '拉高出貨';
+  else if (!priceUp && strongVolume && brokerScore < 45 && totalInst < 0) structure = '倒貨';
+  else if (!priceUp && volumeRatio < 1.1 && (foreignBuy > 0 || trustBuy > 0 || govBuy > 0)) structure = '洗盤換手';
+  else if (priceUp && brokerScore >= 55 && totalInst >= 0) structure = '健康換手';
+  else if (priceUp && totalInst <= 0 && brokerScore <= 50) structure = '追價風險';
+
+  const reason = [
+    priceUp ? '股價上漲' : '股價回檔',
+    strongVolume ? '量能放大' : '量能未明顯放大',
+    foreignBuy > 0 ? '外資5日偏買' : foreignBuy < 0 ? '外資5日偏賣' : '外資中性',
+    trustBuy > 0 ? '投信5日偏買' : trustBuy < 0 ? '投信5日偏賣' : '投信中性',
+    brokerScore >= 60 ? '分點買方占優' : brokerScore <= 45 ? '分點賣方占優' : '分點均衡',
+    govBuy > 0 ? '八大承接' : govBuy < 0 ? '八大調節' : '八大中性',
+  ].join('、');
+
+  return { source, structure, reason };
 }
 
 function judgeMarketScenario(ctx) {
@@ -1000,6 +1059,8 @@ function renderAIScorePanel(score, labels) {
       ${item('AI 多空評分', score.total + ' / 100', '技術30% 法人25% 分點25% 持股10% 八大10%')}
       ${item('籌碼評分', labels.chipScore + ' / 100', labels.mainForce)}
       ${item('情境判斷', labels.scenario, labels.detail)}
+      ${item('資金歸因', labels.moneySource, labels.attributionReason)}
+      ${item('買賣結構', labels.tradeStructure, '吃貨 / 健康換手 / 洗盤 / 拉高出貨 / 倒貨')}
       ${item('法人態度', labels.institution, score.institution.label)}
       ${item('主力分點', labels.broker, '主力出貨 vs 健康換手')}
       ${item('外資判斷', labels.foreign, '真買 / 交易部位需搭配持股變化')}
